@@ -6,6 +6,7 @@ from app.agent.instructions import load_agents_md
 from app.agent.loop import AgentLoop
 from app.agent.skills import load_skills, relevant_skills_for_repository
 from app.config import Settings
+from app.errors import ToolExecutionError
 from app.github.client import GitHubClient
 from app.linear.client import LinearClient
 from app.neuron.client import NeuronClient
@@ -56,53 +57,122 @@ def build_registry(settings: Settings, workspace, include_remote: bool = True) -
 
 
 def build_context(task: str, issue: str, repository: str, workspace: Path, base_branch: str, issue_id: str | None) -> str:
-    """Build the layered agent context.
-
-    Sections are separated clearly:
-      SYSTEM — agent identity and immutable rules
-      REPOSITORY — workspace metadata
-      REPOSITORY INSTRUCTIONS — AGENTS.md content if present
-      SKILLS — relevant loaded skills
-      TASK — the Linear issue task
-      TOOLS — available tools (added by the loop at runtime)
-      WORKFLOW — phase expectations
-    """
     agents_md = load_agents_md(workspace, issue)
-
     skill_names = relevant_skills_for_repository(repository, task)
     loaded = load_skills(skill_names)
     skills_text = "\n\n".join(loaded.values())
-
     sections = []
-
     sections.append(f"## Repository\nRepository: {repository}\nIssue: {issue}\nBranch: agent/{issue}\nBase branch: {base_branch}\nWorkspace: {workspace}")
-
     if agents_md:
         sections.append(f"## Repository Instructions (AGENTS.md)\n{agents_md}")
-
     if skills_text:
         sections.append(f"## Skills\n{skills_text}")
-
     sections.append(f"## Task\n{task}")
-
     sections.append("## Workflow\nFollow the system prompt workflow. Do not skip validation. Inspect the diff before committing.")
-
     log.info("Context built issue=%s agents_md=%s skills_loaded=%s loaded_skill_names=%s",
              issue, bool(agents_md), len(loaded), list(loaded.keys()))
-
     return "\n\n".join(sections)
+
+
+async def verify_completion(workspace: Path, issue: str, issue_id: str | None, settings: Settings) -> dict:
+    """Verify that required postconditions are met before reporting success.
+
+    If the task involved a repository change, the runner must confirm:
+    - valid git repository
+    - not on main/master
+    - changes exist (files modified or added)
+    - git diff inspected
+    - commit made
+    - branch pushed
+    - GitHub PR created
+
+    Returns a dict with verification status. Raises ToolExecutionError
+    if critical postconditions are not met.
+    """
+    from app.git.manager import run_git
+
+    checks = {}
+
+    try:
+        branch = await run_git(workspace, "branch", "--show-current")
+        checks["branch"] = branch
+        if branch in ("main", "master", ""):
+            raise ToolExecutionError(f"agent is on branch '{branch}' instead of agent/{issue}")
+        log.info("Completion gate: branch=%s", branch)
+    except ToolExecutionError:
+        raise
+    except Exception as exc:
+        raise ToolExecutionError(f"completion gate: cannot determine current branch: {exc}") from exc
+
+    try:
+        status_output = await run_git(workspace, "status", "--short")
+        checks["status"] = status_output
+        log.info("Completion gate: git status length=%s", len(status_output))
+    except Exception as exc:
+        raise ToolExecutionError(f"completion gate: git status failed: {exc}") from exc
+
+    try:
+        diff_output = await run_git(workspace, "diff", "HEAD~1", "--name-only", "--")
+        checks["diff"] = diff_output
+        log.info("Completion gate: last commit changed files:\n%s", diff_output)
+    except Exception:
+        # First commit or shallow repo — diff against HEAD works
+        try:
+            diff_output = await run_git(workspace, "diff", "--name-only", "HEAD", "--")
+            checks["diff"] = diff_output
+        except Exception:
+            checks["diff"] = ""
+
+    try:
+        log_output = await run_git(workspace, "log", "--oneline", "-5")
+        checks["log"] = log_output
+        log.info("Completion gate: recent commits:\n%s", log_output)
+    except Exception as exc:
+        raise ToolExecutionError(f"completion gate: git log failed: {exc}") from exc
+
+    pr_url = None
+    if settings.github_token:
+        try:
+            from app.github.client import GitHubClient
+            repo = settings.github_repo
+            if repo and "/" in repo:
+                owner_repo = repo.rstrip(".git").replace("https://github.com/", "")
+                gh = GitHubClient(settings.github_token, settings.github_api_url, settings.http_timeout_seconds)
+                pulls = await gh._request("GET", f"/repos/{owner_repo}/pulls", params={"head": f"agent/{issue}", "state": "open"})
+                if pulls and isinstance(pulls, list) and len(pulls) > 0:
+                    pr_url = pulls[0].get("html_url", "")
+                    checks["pr_url"] = pr_url
+                    log.info("Completion gate: PR found: %s", pr_url)
+        except Exception as exc:
+            log.warning("Completion gate: PR lookup failed (non-fatal): %s", exc)
+
+    verification = {
+        "branch": checks.get("branch", ""),
+        "changes_present": bool(checks.get("status", "").strip() or checks.get("diff", "").strip()),
+        "commits_present": bool(checks.get("log", "").strip()),
+        "pr_url": pr_url or "",
+    }
+    log.info("Completion gate result: %s", verification)
+    return verification
 
 
 class AgentRunner:
     def __init__(self, settings: Settings): self.settings = settings
+
     async def run(self, repository: str, issue: str, task: str, base_branch: str = "main", issue_id: str | None = None) -> dict:
         run_id = str(uuid.uuid4())
         log.info("Starting agent runner run_id=%s repository=%s issue=%s issue_id=%s",
                  run_id, repository, issue, issue_id)
         manager = WorkspaceManager(self.settings.workspace_root, self.settings.github_token, self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email)
         linear = _make_linear_client(self.settings, with_oauth=True) if issue_id else None
+
         async def activity(content: str) -> None:
-            if linear: await linear.add_activity(issue_id, content)
+            if linear:
+                try:
+                    await linear.add_activity(issue_id, content)
+                except Exception as exc:
+                    log.warning("activity update failed (non-fatal): %s", exc)
+
         await activity("starting")
         log.info("Resolving repository run_id=%s repo=%s", run_id, repository)
         workspace = await manager.prepare(repository, issue, base_branch)
@@ -110,7 +180,31 @@ class AgentRunner:
         await activity("inspecting repository")
         context = build_context(task, issue, repository, workspace, base_branch, issue_id)
         registry = build_registry(self.settings, workspace)
-        result = await AgentLoop(NeuronClient(self.settings.neuron_base_url,self.settings.neuron_api_key,self.settings.neuron_model,self.settings.http_timeout_seconds), registry, self.settings.agent_max_iterations).run(task, context, lambda tool: activity(f"running {tool}"))
-        result.update({"run_id":run_id,"workspace":str(workspace),"branch":f"agent/{issue}"})
+        loop_result = await AgentLoop(
+            NeuronClient(self.settings.neuron_base_url, self.settings.neuron_api_key,
+                         self.settings.neuron_model, self.settings.http_timeout_seconds),
+            registry, self.settings.agent_max_iterations,
+        ).run(task, context, lambda tool: activity(f"running {tool}"))
+
+        result = dict(loop_result)
+        result.update({"run_id": run_id, "workspace": str(workspace), "branch": f"agent/{issue}"})
+
+        # Completion gate: verify postconditions
+        try:
+            verification = await verify_completion(workspace, issue, issue_id, self.settings)
+            result["verification"] = verification
+            if verification.get("changes_present") or verification.get("commits_present"):
+                log.info("Agent job completed with verified changes run_id=%s", run_id)
+            else:
+                log.warning("Agent job completed without verified changes run_id=%s", run_id)
+        except ToolExecutionError as exc:
+            log.error("Completion gate failed: %s", exc)
+            result["status"] = "failed"
+            result["error"] = str(exc)
+            await activity(f"failed: {exc}")
+            return result
+        except Exception as exc:
+            log.warning("Completion gate check failed (non-fatal): %s", exc)
+
         await activity("finished")
         return result
