@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "@noser-engineering/opencode-plugin-neuron@0.3.12",
+      {
+        "profiles": [
+          {
+            "id": "christoph-burscher",
+            "name": "christoph-burscher",
+            "baseURL": "https://neuron.noser.com/v1"
+          }
+        ]
+      }
+    ]
+  ]
+}
