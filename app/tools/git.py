@@ -18,6 +18,12 @@ class GitTools:
         await run_git(self.workspace, "add", "-A", "--", ".", ":(exclude).env", ":(exclude)**/.env", ":(exclude).ssh/**", timeout=self.timeout)
         return {"commit": await run_git(self.workspace, "commit", "-m", message, timeout=self.timeout)}
     async def git_push(self, branch: str) -> dict:
+        # Diagnostic: verify auth before attempting push
+        try:
+            await run_git(self.workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=self.token)
+            log.info("git_push: remote reachable and authenticated branch=%s", branch)
+        except Exception as exc:
+            log.warning("git_push: ls-remote failed before push branch=%s error=%s", branch, exc)
         try:
             result = await run_git(self.workspace, "push", "-u", "origin", branch, timeout=self.timeout, token=self.token)
             return {"push": result}
