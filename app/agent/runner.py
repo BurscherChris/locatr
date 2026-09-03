@@ -87,7 +87,8 @@ def build_context(task: str, issue: str, repository: str, workspace: Path, base_
 
     sections.append("## Workflow\nFollow the system prompt workflow. Do not skip validation. Inspect the diff before committing.")
 
-    log.info("Context built issue=%s agents_md=%s skills=%s", issue, bool(agents_md), skill_names)
+    log.info("Context built issue=%s agents_md=%s skills_loaded=%s loaded_skill_names=%s",
+             issue, bool(agents_md), len(loaded), list(loaded.keys()))
 
     return "\n\n".join(sections)
 

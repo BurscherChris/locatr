@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.agent.instructions import find_agents_md, load_agents_md
 from app.agent.prompts import SYSTEM_PROMPT
-from app.agent.skills import available_skills, load_skill, load_skills, relevant_skills_for_repository
+from app.agent.skills import available_skills, load_skill, load_skills, relevant_skills_for_repository, SKILLS_DIR
 from app.main import app
 
 
@@ -45,17 +46,18 @@ class TestSystemPrompt:
 # ---------------------------------------------------------------------------
 
 class TestSkills:
+    BUILT_IN = ["core", "testing", "git", "github", "python", "react", "api"]
+
     def test_available_skills_returns_list(self):
         skills = available_skills()
-        assert "core" in skills
-        assert "testing" in skills
-        assert "git" in skills
+        for name in self.BUILT_IN:
+            assert name in skills, f"missing built-in skill: {name}"
 
     def test_load_skill_returns_content(self):
         content = load_skill("core")
         assert content is not None
-        assert len(content) > 50
-        assert "IMPLEMENT" in content
+        assert len(content) > 100
+        assert "UNDERSTAND" in content
 
     def test_load_missing_skill_returns_none(self):
         assert load_skill("nonexistent_skill_xyz") is None
@@ -69,6 +71,18 @@ class TestSkills:
         result = load_skills(["core", "nonexistent_skill_xyz"])
         assert "core" in result
         assert "nonexistent_skill_xyz" not in result
+
+    def test_all_built_in_skills_load_successfully(self):
+        for name in self.BUILT_IN:
+            content = load_skill(name)
+            assert content is not None, f"built-in skill failed to load: {name}"
+            assert len(content) > 50, f"built-in skill {name} has suspiciously short content ({len(content)} chars)"
+
+    def test_no_skill_not_found_warnings(self, caplog):
+        caplog.set_level(logging.WARNING)
+        load_skills(self.BUILT_IN)
+        warnings = [r for r in caplog.records if "not found" in r.message]
+        assert not warnings, f"unexpected skill warnings: {[r.message for r in warnings]}"
 
     def test_relevant_skills_includes_python(self):
         skills = relevant_skills_for_repository("my-python-project", "implement feature")
@@ -157,12 +171,39 @@ class TestContextBuilder:
             context = build_context("implement python endpoint", "TEST-3", "my-python-api", Path(d), "main", None)
             assert "python" in context.lower() or "WORKFLOW" in context
 
+    def test_context_contains_actual_skill_content_not_only_names(self):
+        """The context sent to Neuron must include the full skill markdown, not just skill names."""
+        from app.agent.runner import build_context
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            context = build_context("api task", "TEST-4", "my-repo", Path(d), "main", None)
+            # core skill content should be present
+            assert "UNDERSTAND" in context, "core skill content missing from context"
+            assert "Never work directly on main/master" in context, "git skill content missing from context"
+            # Skill names alone are NOT sufficient — actual rules must be present
+            assert "## Skills" in context, "Skills section header missing from context"
+
 
 # ---------------------------------------------------------------------------
 # Secret leak check across instruction files
 # ---------------------------------------------------------------------------
 
-class TestInstructionSecrets:
+class TestSkillPathResolution:
+    def test_skills_dir_resolves_independent_of_cwd(self):
+        """SKILLS_DIR is based on the package location, not the process working directory."""
+        assert SKILLS_DIR.is_dir(), f"Skills directory does not exist: {SKILLS_DIR}"
+        assert (SKILLS_DIR / "core.md").is_file(), f"core.md not found at {SKILLS_DIR}"
+        assert (SKILLS_DIR / "testing.md").is_file()
+        assert (SKILLS_DIR / "git.md").is_file()
+        assert (SKILLS_DIR / "github.md").is_file()
+        assert (SKILLS_DIR / "python.md").is_file()
+        assert (SKILLS_DIR / "react.md").is_file()
+        assert (SKILLS_DIR / "api.md").is_file()
+
+    def test_all_skill_files_have_content(self):
+        for md_file in SKILLS_DIR.glob("*.md"):
+            text = md_file.read_text()
+            assert len(text.strip()) > 50, f"{md_file.name} is too short ({len(text.strip())} chars)"
     def test_no_secrets_in_skill_files(self):
         import re
         skills_dir = Path(__file__).resolve().parent.parent / "skills"

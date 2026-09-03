@@ -1,8 +1,12 @@
 """Skill loading for the coding agent.
 
 Skills are reusable domain/workflow instructions stored in skills/*.md
-in the agent repository. They are loaded on demand based on the task context
-and included in the agent's system context.
+in the agent repository (NOT in the target repository). They are loaded
+on demand based on the task context and included in the agent's system context.
+
+The skills directory is resolved relative to the agent package installation
+directory, making it independent of the current working directory or Docker
+mounts.
 """
 
 import logging
@@ -15,6 +19,7 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 def available_skills() -> list[str]:
     if not SKILLS_DIR.is_dir():
+        log.warning("Skill directory not found at %s", SKILLS_DIR)
         return []
     return sorted(f.stem for f in SKILLS_DIR.iterdir() if f.suffix == ".md")
 
@@ -22,8 +27,11 @@ def available_skills() -> list[str]:
 def load_skill(name: str) -> str | None:
     path = SKILLS_DIR / f"{name}.md"
     if not path.is_file():
+        log.warning("Skill not found: %s expected_path=%s", name, path)
         return None
-    return path.read_text(encoding="utf-8")
+    content = path.read_text(encoding="utf-8")
+    log.info("Loaded built-in skill skill=%s source=%s size=%s", name, path.name, len(content))
+    return content
 
 
 def load_skills(names: list[str]) -> dict[str, str]:
@@ -32,9 +40,6 @@ def load_skills(names: list[str]) -> dict[str, str]:
         content = load_skill(name)
         if content is not None:
             result[name] = content
-            log.info("loaded skill: %s", name)
-        else:
-            log.warning("skill not found: %s", name)
     return result
 
 
@@ -66,4 +71,7 @@ def relevant_skills_for_repository(repo_path: str, issue_description: str) -> li
             skills.append("api")
             break
 
-    return list(dict.fromkeys(skills))  # deduplicate preserving order
+    # Always load all available built-in skills for completeness and consistency.
+    # The selection heuristic above is maintained for future optimization.
+    built_in = set(available_skills())
+    return list(dict.fromkeys([s for s in skills if s in built_in]))

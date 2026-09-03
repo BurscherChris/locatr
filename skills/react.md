@@ -1,6 +1,3 @@
 # React
 
-- Follow existing React architecture and component patterns.
-- Reuse existing components where possible.
-- Avoid unnecessary dependencies.
-- Test relevant behavior with the project's existing test framework.
+Inspect existing frontend architecture before changing it. Follow existing component patterns. Reuse existing components, hooks, and utilities. Avoid unnecessary dependencies. Do not hardcode translations if i18n exists. Keep state management consistent with the project. Keep components focused. Preserve existing UX unless the task explicitly changes it. Add or update relevant tests. Run the existing frontend validation commands.

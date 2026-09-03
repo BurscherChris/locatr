@@ -1,7 +1,3 @@
 # GitHub
 
-- Push branches before creating pull requests.
-- PR title should reference the issue (e.g. "PI-142: Implement feature").
-- PR body should include: Summary, Changes, Tests, Linear issue reference.
-- PR should only contain task-related changes — inspect the diff.
-- Verify the PR URL is returned.
+Push only the intended agent branch. Create or update a pull request when the workflow requires it. PR title should reference the Linear issue where appropriate. PR description should summarize the problem, implementation, and tests/validation performed. Never expose credentials in commits, PRs, logs, or comments. Do not merge the PR automatically unless explicitly supported and requested. Do not push directly to main/master.

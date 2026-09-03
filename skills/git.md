@@ -1,7 +1,3 @@
 # Git
 
-- Always work on agent/<issue> branch. Never work directly on main/master.
-- Inspect git status and git diff before committing.
-- Only commit changes related to the task.
-- Never commit secrets, .env files, SSH keys, tokens, or credentials.
-- Keep the working tree clean between tasks.
+Never work directly on main/master. Create or use an agent branch. Inspect git status before modifying. Keep commits focused. Do not commit secrets. Never commit .env files containing credentials. Inspect git diff before commit. Do not rewrite unrelated history. Do not force-push unless explicitly required and safe. Verify the branch before push. Expected branch format: agent/<linear-issue-identifier>

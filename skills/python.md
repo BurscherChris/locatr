@@ -1,7 +1,3 @@
 # Python
 
-- Follow existing project architecture and conventions.
-- Use type hints where the project already uses them.
-- Respect the project's existing formatter/linter/test framework.
-- Avoid unnecessary dependencies.
-- Prefer stdlib solutions when they are sufficient.
+Follow existing Python project structure. Prefer readable, maintainable Python. Use existing dependencies before introducing new ones. Follow existing typing conventions. Use type hints where the project uses them. Keep functions and classes focused. Handle exceptions intentionally. Avoid broad exception swallowing. Keep business logic testable. Do not introduce unnecessary frameworks. Run formatting, linting, and tests when configured by the repository.

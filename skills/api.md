@@ -1,6 +1,3 @@
 # API
 
-- Preserve existing API contracts unless the task explicitly requires changes.
-- Validate inputs.
-- Test API behavior.
-- Do not silently break backwards compatibility.
+Inspect existing API conventions before implementation. Preserve request and response contracts. Validate input at boundaries. Return consistent error responses. Do not expose secrets or internal implementation details. Keep business logic outside transport handlers where appropriate. Update tests for API behavior. Do not silently break existing clients. Document contract changes when required.

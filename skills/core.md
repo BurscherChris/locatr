@@ -1,14 +1,7 @@
-# Core Coding Workflow
+# Core coding discipline
 
-1. UNDERSTAND the task and repository context before making changes.
-2. INSPECT relevant files: README, configuration, existing code, tests.
-3. PLAN the minimal change needed.
-4. IMPLEMENT following existing conventions.
-5. VALIDATE by running relevant tests.
-6. REVIEW the diff — only task-related changes.
-7. COMMIT with a descriptive message.
-8. PUSH the branch.
-9. CREATE a PR with summary, changes, and test results.
-10. REPORT completion.
+Understand the task before changing code. Inspect the relevant repository before implementation. Prefer the smallest correct change. Do not modify unrelated files. Follow existing project architecture and conventions. Reuse existing abstractions before creating new ones. Do not invent APIs, files, configuration, or behavior without evidence. Preserve existing functionality. Do not weaken security to make a task easier. Do not remove tests just because they fail. Validate changes before reporting completion. Inspect git diff before committing. Be honest about what was and was not validated. Stop and report if requirements are fundamentally ambiguous or contradictory.
 
-Do not skip steps. Do not claim success without validation.
+## Workflow
+Follow this sequence explicitly:
+UNDERSTAND → INSPECT → PLAN → IMPLEMENT → TEST → REVIEW → COMMIT → PUSH → PR → REPORT
