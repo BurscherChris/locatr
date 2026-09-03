@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     linear_api_key: str = ""
     linear_webhook_secret: str = ""
     linear_api_url: str = "https://api.linear.app/graphql"
+    linear_client_id: str = ""
+    linear_client_secret: str = ""
+    linear_oauth_redirect_uri: str = ""
+    linear_oauth_scopes: str = "read,write,app:assignable,app:mentionable"
+    linear_oauth_actor: str = "app"
+    linear_token_store_path: str = "/data/linear_tokens.json"
+    github_repo: str = ""
     agent_max_iterations: int = Field(default=50, ge=1, le=200)
     workspace_root: str = "/workspaces"
     command_timeout_seconds: int = Field(default=120, ge=1, le=3600)
@@ -32,7 +39,7 @@ class Settings(BaseSettings):
     def denied_commands(self) -> set[str]: return {x.strip() for x in self.command_denylist.split(",") if x.strip()}
 
     def readiness(self) -> dict[str, bool]:
-        return {"neuron": bool(self.neuron_api_key), "github": bool(self.github_token), "linear": bool(self.linear_api_key)}
+        return {"neuron": bool(self.neuron_api_key), "github": bool(self.github_token), "linear": bool(self.linear_api_key), "linear_oauth": bool(self.linear_client_id and self.linear_client_secret)}
 
 
 @lru_cache

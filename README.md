@@ -52,6 +52,57 @@ The endpoint validates the `Linear-Signature` HMAC-SHA256 over the raw request b
 - `GET /ready` reports which integrations have credentials without exposing them.
 - `POST /webhooks/linear` validates and queues Linear webhook work.
 
+## Linear OAuth
+
+The agent supports Linear OAuth 2.0 authorization-code authentication for app-actor tokens.
+
+### Configure OAuth
+
+1. Create a **Linear OAuth Application** at https://linear.app/settings/api/applications/new.
+2. Set the redirect URI to match your public tunnel URL:
+
+   ```
+   https://<public-tunnel>/oauth/linear/callback
+   ```
+
+3. Enable the `AgentSessionEvent` webhook subscription:
+
+   ```
+   https://<public-tunnel>/webhooks/linear
+   ```
+
+4. Configure in `.env`:
+
+   ```
+   LINEAR_CLIENT_ID=<your-client-id>
+   LINEAR_CLIENT_SECRET=<your-client-secret>
+   LINEAR_OAUTH_REDIRECT_URI=https://<public-tunnel>/oauth/linear/callback
+   LINEAR_OAUTH_SCOPES=read,write,app:assignable,app:mentionable
+   LINEAR_OAUTH_ACTOR=app
+   LINEAR_TOKEN_STORE_PATH=/data/linear_tokens.json
+   ```
+
+5. Start the agent and open the authorize URL in a browser:
+
+   ```
+   https://<public-tunnel>/oauth/linear/start
+   ```
+
+6. After authorizing, Linear redirects back to `/oauth/linear/callback` and tokens are persisted to the configured path.
+
+### OAuth endpoints
+
+| Endpoint                     | Method | Description                               |
+|------------------------------|--------|-------------------------------------------|
+| `/oauth/linear/start`        | GET    | Redirects browser to Linear authorization |
+| `/oauth/linear/callback`     | GET    | Handles authorization-code callback       |
+| `/oauth/linear/status`       | GET    | Reports OAuth state (no tokens)           |
+| `/oauth/linear/logout`       | POST   | Revokes token and deletes local storage   |
+
+### Fallback to API key
+
+When OAuth is not configured, the agent falls back to `LINEAR_API_KEY` for Linear API access. Both paths produce the same `LinearClient` interface so the existing agent runtime, tool loop, and webhook handler work unchanged regardless of which authentication method is active.
+
 ## Security Model
 
 Target repositories are untrusted. Filesystem tools normalize all paths and reject anything outside the issue workspace, plus `.git`, `.ssh`, and `.env`. Secret-like files are excluded from commits. Commands run only inside the container workspace and use a configurable executable allowlist/denylist. Shell chaining, redirection, command substitution, absolute paths, and parent-directory escapes are rejected.

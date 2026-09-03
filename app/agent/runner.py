@@ -15,6 +15,23 @@ from app.tools.registry import ToolRegistry
 from app.tools.shell import ShellTools
 from app.workspace.manager import WorkspaceManager
 
+
+def _linear_token_manager(settings: Settings):
+    if not settings.linear_client_id or not settings.linear_client_secret:
+        return None
+    from app.linear.oauth import LinearOAuthClient, LinearTokenFileStore, LinearTokenManager
+    client = LinearOAuthClient(
+        settings.linear_client_id, settings.linear_client_secret,
+        settings.linear_oauth_redirect_uri, settings.http_timeout_seconds,
+    )
+    store = LinearTokenFileStore(settings.linear_token_store_path)
+    return LinearTokenManager(client, store)
+
+
+def _make_linear_client(settings: Settings, with_oauth: bool = False) -> LinearClient:
+    token_mgr = _linear_token_manager(settings) if with_oauth else None
+    return LinearClient(settings.linear_api_key, settings.linear_api_url, settings.http_timeout_seconds, token_mgr)
+
 log = logging.getLogger(__name__)
 P = lambda props, required=[]: {"type":"object","properties":props,"required":required,"additionalProperties":False}
 S = lambda desc: {"type":"string","description":desc}
@@ -28,20 +45,24 @@ def build_registry(settings: Settings, workspace, include_remote: bool = True) -
         ("git_status","Show git status",P({}),git.git_status), ("git_diff","Show git diff",P({}),git.git_diff), ("git_log","Show commits",P({"limit":{"type":"integer","minimum":1,"maximum":50}}),git.git_log), ("git_create_branch","Create agent branch",P({"branch":S("branch")},["branch"]),git.git_create_branch), ("git_commit","Commit all changes",P({"message":S("commit message")},["message"]),git.git_commit), ("git_push","Push branch",P({"branch":S("branch")},["branch"]),git.git_push)]: registry.register(Tool(name,desc,schema,func))
     if include_remote:
         gh = GitHubTools(GitHubClient(settings.github_token, settings.github_api_url, settings.http_timeout_seconds))
-        linear = LinearTools(LinearClient(settings.linear_api_key, settings.linear_api_url, settings.http_timeout_seconds))
+        linear = LinearTools(_make_linear_client(settings, with_oauth=True))
         for name, desc, schema, func in [("create_pull_request","Create GitHub PR",P({"repository":S("owner/repo"),"title":S("title"),"head":S("branch"),"base":S("base branch"),"body":S("body")},["repository","title","head","base","body"]),gh.create_pull_request),("get_pull_request","Get GitHub PR",P({"repository":S("owner/repo"),"number":{"type":"integer"}},["repository","number"]),gh.get_pull_request),("update_linear_issue","Update Linear issue",P({"issue_id":S("id"),"state_id":S("state"),"description":S("description")},["issue_id"]),linear.update_linear_issue),("add_linear_comment","Comment on Linear issue",P({"issue_id":S("id"),"body":S("comment")},["issue_id","body"]),linear.add_linear_comment),("add_linear_activity","Post Linear activity",P({"issue_id":S("id"),"content":S("activity")},["issue_id","content"]),linear.add_linear_activity)]: registry.register(Tool(name,desc,schema,func))
     return registry
 
 class AgentRunner:
     def __init__(self, settings: Settings): self.settings = settings
     async def run(self, repository: str, issue: str, task: str, base_branch: str = "main", issue_id: str | None = None) -> dict:
-        run_id = str(uuid.uuid4()); manager = WorkspaceManager(self.settings.workspace_root, self.settings.github_token, self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email)
-        linear = LinearClient(self.settings.linear_api_key, self.settings.linear_api_url, self.settings.http_timeout_seconds) if issue_id and self.settings.linear_api_key else None
+        run_id = str(uuid.uuid4())
+        log.info("Starting agent runner run_id=%s repository=%s issue=%s issue_id=%s",
+                 run_id, repository, issue, issue_id)
+        manager = WorkspaceManager(self.settings.workspace_root, self.settings.github_token, self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email)
+        linear = _make_linear_client(self.settings, with_oauth=True) if issue_id else None
         async def activity(content: str) -> None:
             if linear: await linear.add_activity(issue_id, content)
         await activity("starting")
+        log.info("Resolving repository run_id=%s repo=%s", run_id, repository)
         workspace = await manager.prepare(repository, issue, base_branch)
-        log.info("agent run started run_id=%s issue=%s workspace=%s", run_id, issue, workspace)
+        log.info("Agent runner started run_id=%s issue=%s workspace=%s", run_id, issue, workspace)
         await activity("inspecting repository")
         context = f"Issue: {issue}\nRepository: {repository}\nBase branch: {base_branch}\nWorkspace: {workspace}\n"
         registry = build_registry(self.settings, workspace)

@@ -12,5 +12,7 @@ services:
       LINEAR_WEBHOOK_SECRET: ${LINEAR_WEBHOOK_SECRET:-}
     volumes:
       - agent-workspaces:/workspaces
+      - agent-data:/data
 volumes:
   agent-workspaces:
+  agent-data:
