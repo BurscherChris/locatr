@@ -4,10 +4,15 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from app.agent.governance import GovernanceState, GovernanceMode
 from app.agent.loop import AgentLoop
 from app.agent.runner import build_registry, verify_completion
 from app.errors import ToolExecutionError
 from app.git.manager import run_git
+
+
+_GOV_PR = GovernanceState(GovernanceMode.PR_REQUIRED)
+
 
 class ScriptedNeuron:
     def __init__(self): self.calls = 0
@@ -19,7 +24,7 @@ class ScriptedNeuron:
 
 @pytest.mark.asyncio
 async def test_agent_loop_executes_real_tools(settings, tmp_path):
-    result = await AgentLoop(ScriptedNeuron(), build_registry(settings, tmp_path, include_remote=False), 5).run("change file", "test")
+    result = await AgentLoop(ScriptedNeuron(), build_registry(settings, tmp_path, _GOV_PR, include_remote=False), 5).run("change file", "test")
     assert result["status"] == "completed"
     assert (tmp_path / "changed.txt").read_text() == "done\n"
     assert [entry["tool"] for entry in result["tool_history"]] == ["write_file", "run_command"]
@@ -49,7 +54,7 @@ def git_workspace(tmp_path):
 @pytest.mark.asyncio
 async def test_completion_gate_rejects_main_branch(git_workspace, settings):
     with pytest.raises(ToolExecutionError, match="must be agent"):
-        await verify_completion(git_workspace, "TEST-1", settings)
+        await verify_completion(git_workspace, "TEST-1", settings, _GOV_PR)
 
 
 @pytest.mark.asyncio
@@ -59,7 +64,7 @@ async def test_completion_gate_passes_with_push_and_branch(git_workspace, settin
     await run_git(git_workspace, "add", ".")
     await run_git(git_workspace, "commit", "-m", "TEST-2: add newfile")
     await run_git(git_workspace, "push", "-u", "origin", "agent/TEST-2")
-    result = await verify_completion(git_workspace, "TEST-2", settings)
+    result = await verify_completion(git_workspace, "TEST-2", settings, _GOV_PR)
     assert result["branch"] == "agent/TEST-2"
     assert result["changes_present"] is True
     assert result["commits_present"] is True
@@ -73,7 +78,7 @@ async def test_completion_gate_rejects_unpushed_branch(git_workspace, settings):
     await run_git(git_workspace, "add", ".")
     await run_git(git_workspace, "commit", "-m", "TEST-3: add newfile")
     with pytest.raises(ToolExecutionError, match="not pushed"):
-        await verify_completion(git_workspace, "TEST-3", settings)
+        await verify_completion(git_workspace, "TEST-3", settings, _GOV_PR)
 
 
 @pytest.mark.asyncio
@@ -85,4 +90,4 @@ async def test_completion_gate_rejects_unborn_branch(git_workspace, settings):
     clone = git_workspace.parent / "empty_clone"
     subprocess.run(["git", "clone", str(empty), str(clone)], check=True, capture_output=True)
     with pytest.raises(ToolExecutionError, match="must be agent"):
-        await verify_completion(clone, "TEST-4", settings)
+        await verify_completion(clone, "TEST-4", settings, _GOV_PR)

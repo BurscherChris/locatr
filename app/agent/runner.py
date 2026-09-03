@@ -2,6 +2,12 @@ import logging
 import uuid
 from pathlib import Path
 from app.agent.context import AgentContext
+from app.agent.governance import (
+    GovernanceState,
+    check_tool_permitted,
+    detect_explicit_approval,
+    priority_to_governance,
+)
 from app.agent.instructions import load_agents_md
 from app.agent.loop import AgentLoop
 from app.agent.skills import load_skills, relevant_skills_for_repository
@@ -42,17 +48,30 @@ P = lambda props, required=[]: {"type":"object","properties":props,"required":re
 S = lambda desc: {"type":"string","description":desc}
 
 
-def build_registry(settings: Settings, workspace, include_remote: bool = True) -> ToolRegistry:
+def _governance_wrapper(execute, tool_name: str, governance: GovernanceState):
+    """Wrap a tool's execute function to enforce governance rules."""
+    async def wrapped(**kwargs):
+        check_tool_permitted(tool_name, kwargs, governance)
+        return await execute(**kwargs)
+    return wrapped
+
+
+def build_registry(settings: Settings, workspace, governance: GovernanceState, include_remote: bool = True) -> ToolRegistry:
     registry, fs = ToolRegistry(), FilesystemTools(workspace)
     shell, git = ShellTools(workspace, settings.allowed_commands, settings.denied_commands, settings.command_timeout_seconds), GitTools(workspace, settings.github_token, settings.command_timeout_seconds)
     for name, desc, schema, func in [
         ("read_file","Read a workspace file",P({"path":S("relative path")},["path"]),fs.read_file), ("write_file","Write a workspace file",P({"path":S("relative path"),"content":S("complete content")},["path","content"]),fs.write_file), ("list_files","List workspace directory",P({"path":S("relative path")}),fs.list_files), ("search_code","Search text in code",P({"query":S("text"),"path":S("relative path")},["query"]),fs.search_code),
         ("run_command","Run an allowed development command",P({"command":S("command"),"timeout_seconds":{"type":"integer","minimum":1}},["command"]),shell.run_command), ("run_tests","Run tests",P({"command":S("test command")}),shell.run_tests),
-        ("git_status","Show git status",P({}),git.git_status), ("git_diff","Show git diff",P({}),git.git_diff), ("git_log","Show commits",P({"limit":{"type":"integer","minimum":1,"maximum":50}}),git.git_log), ("git_create_branch","Create agent branch",P({"branch":S("branch")},["branch"]),git.git_create_branch), ("git_commit","Commit all changes",P({"message":S("commit message")},["message"]),git.git_commit), ("git_push","Push branch",P({"branch":S("branch")},["branch"]),git.git_push)]: registry.register(Tool(name,desc,schema,func))
+        ("git_status","Show git status",P({}),git.git_status), ("git_diff","Show git diff",P({}),git.git_diff), ("git_log","Show commits",P({"limit":{"type":"integer","minimum":1,"maximum":50}}),git.git_log), ("git_create_branch","Create agent branch",P({"branch":S("branch")},["branch"]),git.git_create_branch), ("git_commit","Commit all changes",P({"message":S("commit message")},["message"]),git.git_commit), ("git_push","Push branch",P({"branch":S("branch")},["branch"]),git.git_push)]:
+        # Wrap every tool with governance
+        wrapped = _governance_wrapper(func, name, governance)
+        registry.register(Tool(name, desc, schema, wrapped))
     if include_remote:
         gh = GitHubTools(GitHubClient(settings.github_token, settings.github_api_url, settings.http_timeout_seconds))
         linear = LinearTools(_make_linear_client(settings, with_oauth=True))
-        for name, desc, schema, func in [("create_pull_request","Create GitHub PR",P({"repository":S("owner/repo"),"title":S("title"),"head":S("branch"),"base":S("base branch"),"body":S("body")},["repository","title","head","base","body"]),gh.create_pull_request),("get_pull_request","Get GitHub PR",P({"repository":S("owner/repo"),"number":{"type":"integer"}},["repository","number"]),gh.get_pull_request),("update_linear_issue","Update Linear issue",P({"issue_id":S("id"),"state_id":S("state"),"description":S("description")},["issue_id"]),linear.update_linear_issue),("add_linear_comment","Comment on Linear issue",P({"issue_id":S("id"),"body":S("comment")},["issue_id","body"]),linear.add_linear_comment),("add_linear_activity","Post Linear activity",P({"issue_id":S("id"),"content":S("activity")},["issue_id","content"]),linear.add_linear_activity)]: registry.register(Tool(name,desc,schema,func))
+        for name, desc, schema, func in [("create_pull_request","Create GitHub PR",P({"repository":S("owner/repo"),"title":S("title"),"head":S("branch"),"base":S("base branch"),"body":S("body")},["repository","title","head","base","body"]),gh.create_pull_request),("get_pull_request","Get GitHub PR",P({"repository":S("owner/repo"),"number":{"type":"integer"}},["repository","number"]),gh.get_pull_request),("update_linear_issue","Update Linear issue",P({"issue_id":S("id"),"state_id":S("state"),"description":S("description")},["issue_id"]),linear.update_linear_issue),("add_linear_comment","Comment on Linear issue",P({"issue_id":S("id"),"body":S("comment")},["issue_id","body"]),linear.add_linear_comment),("add_linear_activity","Post Linear activity",P({"issue_id":S("id"),"content":S("activity")},["issue_id","content"]),linear.add_linear_activity)]:
+            wrapped = _governance_wrapper(func, name, governance)
+            registry.register(Tool(name, desc, schema, wrapped))
     return registry
 
 
@@ -83,71 +102,102 @@ def _owner_repo_from_url(url: str) -> str | None:
     return None
 
 
-async def verify_completion(workspace: Path, issue: str, settings: Settings) -> dict:
-    """Enforce the finalization state machine.
+async def resolve_linear_priority(linear_client: LinearClient | None, issue_id: str | None) -> int | None:
+    """Fetch the Linear issue priority. Returns None if not available."""
+    if not linear_client or not issue_id:
+        return None
+    try:
+        result = await linear_client.execute(
+            "query($id:String!){issue(id:$id){priority}}",
+            {"id": issue_id},
+        )
+        issue = result.get("issue") or {}
+        priority = issue.get("priority")
+        if priority is not None:
+            return int(priority)
+        return None
+    except Exception as exc:
+        log.warning("Failed to resolve Linear priority: %s", exc)
+        return None
 
-    SUCCESS requires ALL of:
-      - branch exists and is agent/<issue>
-      - changes exist (committed)
-      - push succeeded (remote branch exists)
-      - GitHub PR exists
 
-    If ANY are false the job MUST NOT complete.
-    """
+async def verify_completion(workspace: Path, issue: str, settings: Settings, governance: GovernanceState) -> dict:
+    """Enforce the finalization state machine, governed by priority."""
     from app.git.manager import run_git
 
     checks: dict = {}
     branch = ""
 
-    # ── local git checks ──────────────────────────────────────────────
     try:
         branch = await run_git(workspace, "branch", "--show-current")
         checks["branch"] = branch
     except Exception as exc:
         raise ToolExecutionError(f"completion gate: cannot determine branch: {exc}") from exc
 
-    if not branch or branch in ("main", "master"):
-        raise ToolExecutionError(f"completion gate: on branch '{branch}' — must be agent/{issue}")
+    is_low = governance.mode.value == "autonomous"
+    is_awaiting = governance.mode.value == "awaiting_approval"
 
-    try:
-        status_out = await run_git(workspace, "status", "--short")
-        checks["status"] = status_out
-    except Exception as exc:
-        raise ToolExecutionError(f"completion gate: git status failed: {exc}") from exc
+    # AWAITING_APPROVAL is not a failure — it is a valid waiting state.
+    if is_awaiting:
+        log.info("Completion gate: awaiting approval — not a failure")
+        return {
+            "branch": branch,
+            "changes_present": False,
+            "commits_present": False,
+            "push_ok": False,
+            "pr_url": "",
+            "governance": governance.mode.value,
+            "status": "awaiting_approval",
+        }
 
-    try:
-        log_out = await run_git(workspace, "log", "--oneline", "-5")
-        checks["log"] = log_out
-    except Exception as exc:
-        raise ToolExecutionError(f"completion gate: git log failed: {exc}") from exc
+    if is_low:
+        if branch in ("main", "master"):
+            log.info("Completion gate: LOW priority, master branch is allowed")
+        else:
+            raise ToolExecutionError(f"completion gate: LOW priority expected master, but on branch '{branch}'")
+    else:
+        if not branch or branch in ("main", "master"):
+            raise ToolExecutionError(f"completion gate: on branch '{branch}' — must be agent/{issue}")
 
-    # ── remote push verification ──────────────────────────────────────
+    if not is_low:
+        try:
+            status_out = await run_git(workspace, "status", "--short")
+            checks["status"] = status_out
+        except Exception as exc:
+            raise ToolExecutionError(f"completion gate: git status failed: {exc}") from exc
+
+        try:
+            log_out = await run_git(workspace, "log", "--oneline", "-5")
+            checks["log"] = log_out
+        except Exception as exc:
+            raise ToolExecutionError(f"completion gate: git log failed: {exc}") from exc
+
     push_ok = False
-    remote_branch = ""
-    try:
-        ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
-        push_ok = bool(ls_remote.strip())
-        remote_branch = ls_remote.strip()[:40] if push_ok else ""
-        checks["push_ok"] = push_ok
-        checks["remote_branch"] = remote_branch
-        log.info("Completion gate: remote branch check: pushed=%s remote_sha=%s", push_ok, remote_branch[:12] if remote_branch else "")
-    except Exception as exc:
-        log.warning("Completion gate: push verification failed (non-fatal in check): %s", exc)
-        checks["push_ok"] = False
+    if is_low:
+        # For LOW, verify master was pushed
+        try:
+            ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
+            push_ok = bool(ls_remote.strip())
+            checks["push_ok"] = push_ok
+        except Exception:
+            checks["push_ok"] = False
+    else:
+        try:
+            ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
+            push_ok = bool(ls_remote.strip())
+            checks["push_ok"] = push_ok
+        except Exception:
+            checks["push_ok"] = False
 
     if not push_ok:
         raise ToolExecutionError(
-            f"completion gate: branch agent/{issue} was not pushed to remote. "
-            "The LLM must push the branch before the task is considered complete."
+            f"completion gate: branch agent/{issue} was not pushed to remote."
         )
 
-    # ── GitHub PR verification ────────────────────────────────────────
     pr_url = ""
-    if settings.github_token:
+    if governance.requires_pr and settings.github_token:
         repo = _owner_repo_from_url(settings.github_repo)
-        if not repo:
-            log.warning("Completion gate: GITHUB_REPO not configured — skipping PR verification")
-        else:
+        if repo:
             try:
                 gh = GitHubClient(settings.github_token, settings.github_api_url, settings.http_timeout_seconds)
                 pulls = await gh._request("GET", f"/repos/{repo}/pulls", params={"head": f"agent/{issue}", "state": "open"})
@@ -162,12 +212,11 @@ async def verify_completion(workspace: Path, issue: str, settings: Settings) -> 
             except Exception as exc:
                 log.warning("Completion gate: PR lookup failed: %s", exc)
 
-            if not pr_url:
-                raise ToolExecutionError(
-                    f"completion gate: no open PR found for branch agent/{issue}. "
-                    "The LLM must create a PR before the task is considered complete."
-                )
-    else:
+        if not pr_url and repo:
+            raise ToolExecutionError(
+                f"completion gate: no open PR found for branch agent/{issue}."
+            )
+    elif not settings.github_token:
         log.warning("Completion gate: GitHub token not configured — skipping PR verification")
 
     verification = {
@@ -176,8 +225,9 @@ async def verify_completion(workspace: Path, issue: str, settings: Settings) -> 
         "commits_present": True,
         "push_ok": push_ok,
         "pr_url": pr_url,
+        "governance": governance.mode.value,
     }
-    log.info("Completion gate: ALL CHECKS PASSED branch=%s pr_url=%s", branch, pr_url)
+    log.info("Completion gate: ALL CHECKS PASSED branch=%s pr_url=%s governance=%s", branch, pr_url, governance.mode.value)
     return verification
 
 
@@ -194,6 +244,11 @@ class AgentRunner:
         )
         linear = _make_linear_client(self.settings, with_oauth=True) if issue_id else None
 
+        # Resolve governance from Linear priority
+        priority = await resolve_linear_priority(linear, issue_id)
+        governance = priority_to_governance(priority)
+        log.info("Governance resolved issue=%s priority=%s mode=%s", issue, priority, governance.mode.value)
+
         async def activity(content: str) -> None:
             if linear:
                 try:
@@ -205,10 +260,41 @@ class AgentRunner:
         log.info("Resolving repository run_id=%s repo=%s", run_id, repository)
         workspace = await manager.prepare(repository, issue, base_branch)
         log.info("Agent runner started run_id=%s issue=%s workspace=%s", run_id, issue, workspace)
-        await activity("inspecting repository")
 
+        # ── HIGH priority: post proposal and wait ──────────────────────────
+        if governance.mode.value == "awaiting_approval":
+            await activity("preparing implementation proposal (HIGH priority)")
+            try:
+                proposal = (
+                    f"## Implementation proposal\n\n"
+                    f"I will implement the task as described:\n\n"
+                    f"1. Inspect the existing code structure.\n"
+                    f"2. Make the required changes.\n"
+                    f"3. Add or update tests.\n"
+                    f"4. Run validation.\n"
+                    f"5. Commit and create a pull request.\n\n"
+                    f"Please explicitly approve this proposal by commenting with 'APPROVED' "
+                    f"or 'Approved' on this issue. I will wait for your approval before "
+                    f"proceeding with any repository modifications."
+                )
+                await linear.add_comment(issue_id, proposal)
+                log.info("Governance: posted proposal comment for HIGH priority issue=%s", issue)
+            except Exception as exc:
+                log.warning("Governance: failed to post proposal comment: %s", exc)
+
+            result = {
+                "run_id": run_id,
+                "status": "awaiting_approval",
+                "governance": governance.mode.value,
+                "workspace": str(workspace),
+                "branch": f"agent/{issue}",
+            }
+            await activity("awaiting explicit approval — implementation not started")
+            return result
+
+        await activity("inspecting repository")
         context = build_context(task, issue, repository, workspace, base_branch, issue_id)
-        registry = build_registry(self.settings, workspace)
+        registry = build_registry(self.settings, workspace, governance)
         loop_result = await AgentLoop(
             NeuronClient(
                 self.settings.neuron_base_url, self.settings.neuron_api_key,
@@ -218,11 +304,20 @@ class AgentRunner:
         ).run(task, context, lambda tool: activity(f"running {tool}"))
 
         result = dict(loop_result)
-        result.update({"run_id": run_id, "workspace": str(workspace), "branch": f"agent/{issue}"})
+        result.update({
+            "run_id": run_id,
+            "workspace": str(workspace),
+            "branch": f"agent/{issue}",
+            "governance": governance.mode.value,
+        })
 
         try:
-            verification = await verify_completion(workspace, issue, self.settings)
+            verification = await verify_completion(workspace, issue, self.settings, governance)
             result["verification"] = verification
+            if verification.get("status") == "awaiting_approval":
+                log.info("Agent job awaiting approval run_id=%s", run_id)
+                result["status"] = "awaiting_approval"
+                return result
             log.info("Agent job completed successfully run_id=%s pr_url=%s", run_id, verification.get("pr_url", ""))
         except ToolExecutionError as exc:
             log.error("Agent job finalization failed: %s", exc)
