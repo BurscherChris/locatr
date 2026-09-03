@@ -108,6 +108,11 @@ class TestSkills:
             assert "git" in skills, f"git missing for {name}"
             assert "github" in skills, f"github missing for {name}"
 
+    def test_relevant_skills_includes_all_built_in(self):
+        skills = relevant_skills_for_repository("my-repo", "task")
+        for name in ["core", "testing", "git", "github", "python", "react", "api"]:
+            assert name in skills, f"built-in skill {name} not in relevant list"
+
 
 # ---------------------------------------------------------------------------
 # AGENTS.md discovery tests

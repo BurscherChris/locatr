@@ -46,8 +46,9 @@ def load_skills(names: list[str]) -> dict[str, str]:
 def relevant_skills_for_repository(repo_path: str, issue_description: str) -> list[str]:
     """Determine which skills are relevant based on repository content and task.
 
-    Returns skill names in priority order. This is a simple heuristic;
-    the set can be expanded over time.
+    Returns skill names in priority order. Built-in skills that are always
+    relevant are included unconditionally. Additional skills are selected
+    based on repository name and task keywords.
     """
     skills = ["core", "testing", "git", "github"]
     lower_repo = repo_path.lower()
@@ -56,10 +57,8 @@ def relevant_skills_for_repository(repo_path: str, issue_description: str) -> li
     if "py" in lower_repo or "python" in lower_task or not any(x in lower_repo for x in ["js", "ts", "react", "node"]):
         skills.append("python")
 
-    for kw in ["react", "js", "ts", "node", "frontend"]:
-        if kw in lower_repo or kw in lower_task:
-            skills.append("react")
-            break
+    if any(kw in lower_repo or kw in lower_task for kw in ["react", "js", "ts", "node", "frontend"]):
+        skills.append("react")
 
     for kw in ["sql", "db", "database", "migration", "schema", "postgres", "mysql"]:
         if kw in lower_repo or kw in lower_task:
@@ -71,7 +70,13 @@ def relevant_skills_for_repository(repo_path: str, issue_description: str) -> li
             skills.append("api")
             break
 
-    # Always load all available built-in skills for completeness and consistency.
-    # The selection heuristic above is maintained for future optimization.
+    # Include every built-in skill that exists on disk.  This guarantees that
+    # newly added skills/*.md files are automatically picked up without code
+    # changes, and no skill goes missing just because the keyword heuristic
+    # did not match.
     built_in = set(available_skills())
-    return list(dict.fromkeys([s for s in skills if s in built_in]))
+    for name in sorted(built_in):
+        if name not in skills:
+            skills.append(name)
+
+    return list(dict.fromkeys(skills))
