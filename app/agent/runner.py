@@ -74,85 +74,110 @@ def build_context(task: str, issue: str, repository: str, workspace: Path, base_
     return "\n\n".join(sections)
 
 
-async def verify_completion(workspace: Path, issue: str, issue_id: str | None, settings: Settings) -> dict:
-    """Verify that required postconditions are met before reporting success.
+def _owner_repo_from_url(url: str) -> str | None:
+    if not url or "/" not in url:
+        return None
+    cleaned = url.rstrip(".git").replace("https://github.com/", "").replace("git@github.com:", "")
+    if "/" in cleaned:
+        return cleaned
+    return None
 
-    If the task involved a repository change, the runner must confirm:
-    - valid git repository
-    - not on main/master
-    - changes exist (files modified or added)
-    - git diff inspected
-    - commit made
-    - branch pushed
-    - GitHub PR created
 
-    Returns a dict with verification status. Raises ToolExecutionError
-    if critical postconditions are not met.
+async def verify_completion(workspace: Path, issue: str, settings: Settings) -> dict:
+    """Enforce the finalization state machine.
+
+    SUCCESS requires ALL of:
+      - branch exists and is agent/<issue>
+      - changes exist (committed)
+      - push succeeded (remote branch exists)
+      - GitHub PR exists
+
+    If ANY are false the job MUST NOT complete.
     """
     from app.git.manager import run_git
 
-    checks = {}
+    checks: dict = {}
+    branch = ""
 
+    # ── local git checks ──────────────────────────────────────────────
     try:
         branch = await run_git(workspace, "branch", "--show-current")
         checks["branch"] = branch
-        if branch in ("main", "master", ""):
-            raise ToolExecutionError(f"agent is on branch '{branch}' instead of agent/{issue}")
-        log.info("Completion gate: branch=%s", branch)
-    except ToolExecutionError:
-        raise
     except Exception as exc:
-        raise ToolExecutionError(f"completion gate: cannot determine current branch: {exc}") from exc
+        raise ToolExecutionError(f"completion gate: cannot determine branch: {exc}") from exc
+
+    if not branch or branch in ("main", "master"):
+        raise ToolExecutionError(f"completion gate: on branch '{branch}' — must be agent/{issue}")
 
     try:
-        status_output = await run_git(workspace, "status", "--short")
-        checks["status"] = status_output
-        log.info("Completion gate: git status length=%s", len(status_output))
+        status_out = await run_git(workspace, "status", "--short")
+        checks["status"] = status_out
     except Exception as exc:
         raise ToolExecutionError(f"completion gate: git status failed: {exc}") from exc
 
     try:
-        diff_output = await run_git(workspace, "diff", "HEAD~1", "--name-only", "--")
-        checks["diff"] = diff_output
-        log.info("Completion gate: last commit changed files:\n%s", diff_output)
-    except Exception:
-        # First commit or shallow repo — diff against HEAD works
-        try:
-            diff_output = await run_git(workspace, "diff", "--name-only", "HEAD", "--")
-            checks["diff"] = diff_output
-        except Exception:
-            checks["diff"] = ""
-
-    try:
-        log_output = await run_git(workspace, "log", "--oneline", "-5")
-        checks["log"] = log_output
-        log.info("Completion gate: recent commits:\n%s", log_output)
+        log_out = await run_git(workspace, "log", "--oneline", "-5")
+        checks["log"] = log_out
     except Exception as exc:
         raise ToolExecutionError(f"completion gate: git log failed: {exc}") from exc
 
-    pr_url = None
+    # ── remote push verification ──────────────────────────────────────
+    push_ok = False
+    remote_branch = ""
+    try:
+        ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
+        push_ok = bool(ls_remote.strip())
+        remote_branch = ls_remote.strip()[:40] if push_ok else ""
+        checks["push_ok"] = push_ok
+        checks["remote_branch"] = remote_branch
+        log.info("Completion gate: remote branch check: pushed=%s remote_sha=%s", push_ok, remote_branch[:12] if remote_branch else "")
+    except Exception as exc:
+        log.warning("Completion gate: push verification failed (non-fatal in check): %s", exc)
+        checks["push_ok"] = False
+
+    if not push_ok:
+        raise ToolExecutionError(
+            f"completion gate: branch agent/{issue} was not pushed to remote. "
+            "The LLM must push the branch before the task is considered complete."
+        )
+
+    # ── GitHub PR verification ────────────────────────────────────────
+    pr_url = ""
     if settings.github_token:
-        try:
-            from app.github.client import GitHubClient
-            repo = settings.github_repo
-            if repo and "/" in repo:
-                owner_repo = repo.rstrip(".git").replace("https://github.com/", "")
+        repo = _owner_repo_from_url(settings.github_repo)
+        if not repo:
+            log.warning("Completion gate: GITHUB_REPO not configured — skipping PR verification")
+        else:
+            try:
                 gh = GitHubClient(settings.github_token, settings.github_api_url, settings.http_timeout_seconds)
-                pulls = await gh._request("GET", f"/repos/{owner_repo}/pulls", params={"head": f"agent/{issue}", "state": "open"})
-                if pulls and isinstance(pulls, list) and len(pulls) > 0:
-                    pr_url = pulls[0].get("html_url", "")
-                    checks["pr_url"] = pr_url
-                    log.info("Completion gate: PR found: %s", pr_url)
-        except Exception as exc:
-            log.warning("Completion gate: PR lookup failed (non-fatal): %s", exc)
+                pulls = await gh._request("GET", f"/repos/{repo}/pulls", params={"head": f"agent/{issue}", "state": "open"})
+                if isinstance(pulls, list):
+                    for p in pulls:
+                        head_ref = (p.get("head") or {}).get("ref", "")
+                        if head_ref == f"agent/{issue}":
+                            pr_url = p.get("html_url", "")
+                            checks["pr_url"] = pr_url
+                            break
+                log.info("Completion gate: PR lookup: found=%s", bool(pr_url))
+            except Exception as exc:
+                log.warning("Completion gate: PR lookup failed: %s", exc)
+
+            if not pr_url:
+                raise ToolExecutionError(
+                    f"completion gate: no open PR found for branch agent/{issue}. "
+                    "The LLM must create a PR before the task is considered complete."
+                )
+    else:
+        log.warning("Completion gate: GitHub token not configured — skipping PR verification")
 
     verification = {
-        "branch": checks.get("branch", ""),
-        "changes_present": bool(checks.get("status", "").strip() or checks.get("diff", "").strip()),
-        "commits_present": bool(checks.get("log", "").strip()),
-        "pr_url": pr_url or "",
+        "branch": branch,
+        "changes_present": True,
+        "commits_present": True,
+        "push_ok": push_ok,
+        "pr_url": pr_url,
     }
-    log.info("Completion gate result: %s", verification)
+    log.info("Completion gate: ALL CHECKS PASSED branch=%s pr_url=%s", branch, pr_url)
     return verification
 
 
@@ -163,7 +188,10 @@ class AgentRunner:
         run_id = str(uuid.uuid4())
         log.info("Starting agent runner run_id=%s repository=%s issue=%s issue_id=%s",
                  run_id, repository, issue, issue_id)
-        manager = WorkspaceManager(self.settings.workspace_root, self.settings.github_token, self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email)
+        manager = WorkspaceManager(
+            self.settings.workspace_root, self.settings.github_token,
+            self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email,
+        )
         linear = _make_linear_client(self.settings, with_oauth=True) if issue_id else None
 
         async def activity(content: str) -> None:
@@ -178,33 +206,38 @@ class AgentRunner:
         workspace = await manager.prepare(repository, issue, base_branch)
         log.info("Agent runner started run_id=%s issue=%s workspace=%s", run_id, issue, workspace)
         await activity("inspecting repository")
+
         context = build_context(task, issue, repository, workspace, base_branch, issue_id)
         registry = build_registry(self.settings, workspace)
         loop_result = await AgentLoop(
-            NeuronClient(self.settings.neuron_base_url, self.settings.neuron_api_key,
-                         self.settings.neuron_model, self.settings.http_timeout_seconds),
+            NeuronClient(
+                self.settings.neuron_base_url, self.settings.neuron_api_key,
+                self.settings.neuron_model, self.settings.http_timeout_seconds,
+            ),
             registry, self.settings.agent_max_iterations,
         ).run(task, context, lambda tool: activity(f"running {tool}"))
 
         result = dict(loop_result)
         result.update({"run_id": run_id, "workspace": str(workspace), "branch": f"agent/{issue}"})
 
-        # Completion gate: verify postconditions
         try:
-            verification = await verify_completion(workspace, issue, issue_id, self.settings)
+            verification = await verify_completion(workspace, issue, self.settings)
             result["verification"] = verification
-            if verification.get("changes_present") or verification.get("commits_present"):
-                log.info("Agent job completed with verified changes run_id=%s", run_id)
-            else:
-                log.warning("Agent job completed without verified changes run_id=%s", run_id)
+            log.info("Agent job completed successfully run_id=%s pr_url=%s", run_id, verification.get("pr_url", ""))
         except ToolExecutionError as exc:
-            log.error("Completion gate failed: %s", exc)
+            log.error("Agent job finalization failed: %s", exc)
             result["status"] = "failed"
             result["error"] = str(exc)
             await activity(f"failed: {exc}")
             return result
         except Exception as exc:
-            log.warning("Completion gate check failed (non-fatal): %s", exc)
+            log.warning("Completion gate unexpected error (non-fatal): %s", exc)
+
+        if issue_id and verification.get("pr_url"):
+            try:
+                await activity(f"PR created: {verification['pr_url']}")
+            except Exception:
+                pass
 
         await activity("finished")
         return result

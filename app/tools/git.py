@@ -1,6 +1,9 @@
+import logging
 from pathlib import Path
 from app.errors import GitError
 from app.git.manager import run_git
+
+log = logging.getLogger(__name__)
 
 class GitTools:
     def __init__(self, workspace: Path, token: str, timeout: int): self.workspace, self.token, self.timeout = workspace, token, timeout
@@ -15,4 +18,9 @@ class GitTools:
         await run_git(self.workspace, "add", "-A", "--", ".", ":(exclude).env", ":(exclude)**/.env", ":(exclude).ssh/**", timeout=self.timeout)
         return {"commit": await run_git(self.workspace, "commit", "-m", message, timeout=self.timeout)}
     async def git_push(self, branch: str) -> dict:
-        return {"push": await run_git(self.workspace, "push", "-u", "origin", branch, timeout=self.timeout, token=self.token)}
+        try:
+            result = await run_git(self.workspace, "push", "-u", "origin", branch, timeout=self.timeout, token=self.token)
+            return {"push": result}
+        except Exception as exc:
+            log.warning("git_push failed branch=%s error=%s", branch, exc)
+            raise

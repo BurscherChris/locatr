@@ -55,7 +55,8 @@ class AgentLoop:
                     if inspect.isawaitable(notification):
                         await notification
                 result = await self.tools.execute(name, arguments_raw)
-                log.info("Agent iteration %s tool=%s ok=%s", iteration, name, result.ok)
+                log.info("Agent iteration %s tool=%s ok=%s error=%s",
+                         iteration, name, result.ok, result.error if not result.ok else "")
                 history.append({"tool": name, "ok": result.ok})
                 messages.append({
                     "role": "tool",

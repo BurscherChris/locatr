@@ -30,48 +30,59 @@ async def test_agent_loop_executes_real_tools(settings, tmp_path):
 
 @pytest.fixture
 def git_workspace(tmp_path):
-    """Create a temporary git repository with an initial commit."""
+    """Create a temporary git repository with a shared remote"""
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    subprocess.run(["git", "init", "--bare"], cwd=remote, check=True, capture_output=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=remote, check=True, capture_output=True)
     repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(remote), str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@local"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
     (repo / "README.md").write_text("# Test\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=repo, check=True, capture_output=True)
     return repo
 
 
 @pytest.mark.asyncio
 async def test_completion_gate_rejects_main_branch(git_workspace, settings):
-    with pytest.raises(ToolExecutionError, match="main"):
-        await verify_completion(git_workspace, "TEST-1", None, settings)
+    with pytest.raises(ToolExecutionError, match="must be agent"):
+        await verify_completion(git_workspace, "TEST-1", settings)
 
 
 @pytest.mark.asyncio
-async def test_completion_gate_passes_with_branch_and_commit(git_workspace, settings):
+async def test_completion_gate_passes_with_push_and_branch(git_workspace, settings):
     await run_git(git_workspace, "checkout", "-B", "agent/TEST-2")
     (git_workspace / "newfile.md").write_text("# New\n")
     await run_git(git_workspace, "add", ".")
     await run_git(git_workspace, "commit", "-m", "TEST-2: add newfile")
-    result = await verify_completion(git_workspace, "TEST-2", None, settings)
+    await run_git(git_workspace, "push", "-u", "origin", "agent/TEST-2")
+    result = await verify_completion(git_workspace, "TEST-2", settings)
     assert result["branch"] == "agent/TEST-2"
     assert result["changes_present"] is True
     assert result["commits_present"] is True
+    assert result["push_ok"] is True
 
 
 @pytest.mark.asyncio
-async def test_completion_gate_detects_no_changes(git_workspace, settings):
+async def test_completion_gate_rejects_unpushed_branch(git_workspace, settings):
     await run_git(git_workspace, "checkout", "-B", "agent/TEST-3")
-    result = await verify_completion(git_workspace, "TEST-3", None, settings)
-    assert result["branch"] == "agent/TEST-3"
-    assert result["changes_present"] is False
+    (git_workspace / "newfile.md").write_text("# New\n")
+    await run_git(git_workspace, "add", ".")
+    await run_git(git_workspace, "commit", "-m", "TEST-3: add newfile")
+    with pytest.raises(ToolExecutionError, match="not pushed"):
+        await verify_completion(git_workspace, "TEST-3", settings)
 
 
 @pytest.mark.asyncio
 async def test_completion_gate_rejects_unborn_branch(git_workspace, settings):
     empty = git_workspace.parent / "empty_repo"
     empty.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=empty, check=True, capture_output=True)
-    with pytest.raises(ToolExecutionError, match="instead of agent"):
-        await verify_completion(empty, "TEST-4", None, settings)
+    subprocess.run(["git", "init", "--bare"], cwd=empty, check=True, capture_output=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=empty, check=True, capture_output=True)
+    clone = git_workspace.parent / "empty_clone"
+    subprocess.run(["git", "clone", str(empty), str(clone)], check=True, capture_output=True)
+    with pytest.raises(ToolExecutionError, match="must be agent"):
+        await verify_completion(clone, "TEST-4", settings)

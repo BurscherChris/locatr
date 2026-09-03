@@ -5,7 +5,7 @@ from app.config import Settings
 
 @pytest.fixture
 def settings(tmp_path):
-    return Settings(workspace_root=str(tmp_path / "workspaces"), neuron_api_key="test", github_token="token", linear_api_key="linear", linear_webhook_secret="secret", command_timeout_seconds=5)
+    return Settings(workspace_root=str(tmp_path / "workspaces"), neuron_api_key="test", github_token="token", linear_api_key="linear", linear_webhook_secret="secret", command_timeout_seconds=5, github_repo="")
 
 @pytest.fixture
 def git_repository(tmp_path):
