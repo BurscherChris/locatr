@@ -33,7 +33,7 @@ def _classify_event(payload: dict) -> dict:
 
     event_type = str(payload.get("type") or "")
     action = str(payload.get("action") or "")
-    event_id = str(payload.get("webhookId") or payload.get("id") or payload.get("eventId") or "")
+    webhook_id = str(payload.get("webhookId") or "")
 
     data = payload.get("data")
     if isinstance(data, dict) and data.get("agentSession"):
@@ -64,20 +64,28 @@ def _classify_event(payload: dict) -> dict:
         agent_session_source = data.get("agentSessionId")
     agent_session_id = str(agent_session_source or "")
 
+    # The idempotency key must be unique per event delivery.
+    # Linear uses the same webhookId for all events from a subscription.
+    # The agent_session_id uniquely identifies the session and action
+    # distinguishes delivery (created vs prompted vs retry).
+    idempotency_key = f"{agent_session_id}:{action}" if agent_session_id else webhook_id
+
     is_agent_session = (
         event_type.lower() in ("agentsession", "agentsessionevent")
         or action.lower() in ("created", "prompted")
     )
 
-    log.info("Webhook parsed event_type=%s action=%s event_id=%s identifier=%s "
+    log.info("Webhook parsed event_type=%s action=%s webhook_id=%s idempotency_key=%s identifier=%s "
              "agent_session_id=%s repo_present=%s task_present=%s",
-             event_type, action, event_id, identifier,
+             event_type, action, webhook_id, idempotency_key, identifier,
              agent_session_id, bool(repository), bool(task))
 
     return {
         "event_type": event_type,
         "action": action,
-        "event_id": event_id,
+        "event_id": idempotency_key,
+        "idempotency_key": idempotency_key,
+        "webhook_id": webhook_id,
         "issue_identifier": identifier,
         "issue_id": issue_id,
         "repository": repository,

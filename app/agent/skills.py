@@ -1,0 +1,69 @@
+"""Skill loading for the coding agent.
+
+Skills are reusable domain/workflow instructions stored in skills/*.md
+in the agent repository. They are loaded on demand based on the task context
+and included in the agent's system context.
+"""
+
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
+
+
+def available_skills() -> list[str]:
+    if not SKILLS_DIR.is_dir():
+        return []
+    return sorted(f.stem for f in SKILLS_DIR.iterdir() if f.suffix == ".md")
+
+
+def load_skill(name: str) -> str | None:
+    path = SKILLS_DIR / f"{name}.md"
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def load_skills(names: list[str]) -> dict[str, str]:
+    result = {}
+    for name in names:
+        content = load_skill(name)
+        if content is not None:
+            result[name] = content
+            log.info("loaded skill: %s", name)
+        else:
+            log.warning("skill not found: %s", name)
+    return result
+
+
+def relevant_skills_for_repository(repo_path: str, issue_description: str) -> list[str]:
+    """Determine which skills are relevant based on repository content and task.
+
+    Returns skill names in priority order. This is a simple heuristic;
+    the set can be expanded over time.
+    """
+    skills = ["core", "testing", "git", "github"]
+    lower_repo = repo_path.lower()
+    lower_task = issue_description.lower()
+
+    if "py" in lower_repo or "python" in lower_task or not any(x in lower_repo for x in ["js", "ts", "react", "node"]):
+        skills.append("python")
+
+    for kw in ["react", "js", "ts", "node", "frontend"]:
+        if kw in lower_repo or kw in lower_task:
+            skills.append("react")
+            break
+
+    for kw in ["sql", "db", "database", "migration", "schema", "postgres", "mysql"]:
+        if kw in lower_repo or kw in lower_task:
+            skills.append("database")
+            break
+
+    for kw in ["api", "graphql", "rest", "endpoint", "http"]:
+        if kw in lower_repo or kw in lower_task:
+            skills.append("api")
+            break
+
+    return list(dict.fromkeys(skills))  # deduplicate preserving order

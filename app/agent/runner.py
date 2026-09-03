@@ -1,7 +1,10 @@
 import logging
 import uuid
+from pathlib import Path
 from app.agent.context import AgentContext
+from app.agent.instructions import load_agents_md
 from app.agent.loop import AgentLoop
+from app.agent.skills import load_skills, relevant_skills_for_repository
 from app.config import Settings
 from app.github.client import GitHubClient
 from app.linear.client import LinearClient
@@ -32,9 +35,11 @@ def _make_linear_client(settings: Settings, with_oauth: bool = False) -> LinearC
     token_mgr = _linear_token_manager(settings) if with_oauth else None
     return LinearClient(settings.linear_api_key, settings.linear_api_url, settings.http_timeout_seconds, token_mgr)
 
+
 log = logging.getLogger(__name__)
 P = lambda props, required=[]: {"type":"object","properties":props,"required":required,"additionalProperties":False}
 S = lambda desc: {"type":"string","description":desc}
+
 
 def build_registry(settings: Settings, workspace, include_remote: bool = True) -> ToolRegistry:
     registry, fs = ToolRegistry(), FilesystemTools(workspace)
@@ -48,6 +53,44 @@ def build_registry(settings: Settings, workspace, include_remote: bool = True) -
         linear = LinearTools(_make_linear_client(settings, with_oauth=True))
         for name, desc, schema, func in [("create_pull_request","Create GitHub PR",P({"repository":S("owner/repo"),"title":S("title"),"head":S("branch"),"base":S("base branch"),"body":S("body")},["repository","title","head","base","body"]),gh.create_pull_request),("get_pull_request","Get GitHub PR",P({"repository":S("owner/repo"),"number":{"type":"integer"}},["repository","number"]),gh.get_pull_request),("update_linear_issue","Update Linear issue",P({"issue_id":S("id"),"state_id":S("state"),"description":S("description")},["issue_id"]),linear.update_linear_issue),("add_linear_comment","Comment on Linear issue",P({"issue_id":S("id"),"body":S("comment")},["issue_id","body"]),linear.add_linear_comment),("add_linear_activity","Post Linear activity",P({"issue_id":S("id"),"content":S("activity")},["issue_id","content"]),linear.add_linear_activity)]: registry.register(Tool(name,desc,schema,func))
     return registry
+
+
+def build_context(task: str, issue: str, repository: str, workspace: Path, base_branch: str, issue_id: str | None) -> str:
+    """Build the layered agent context.
+
+    Sections are separated clearly:
+      SYSTEM — agent identity and immutable rules
+      REPOSITORY — workspace metadata
+      REPOSITORY INSTRUCTIONS — AGENTS.md content if present
+      SKILLS — relevant loaded skills
+      TASK — the Linear issue task
+      TOOLS — available tools (added by the loop at runtime)
+      WORKFLOW — phase expectations
+    """
+    agents_md = load_agents_md(workspace, issue)
+
+    skill_names = relevant_skills_for_repository(repository, task)
+    loaded = load_skills(skill_names)
+    skills_text = "\n\n".join(loaded.values())
+
+    sections = []
+
+    sections.append(f"## Repository\nRepository: {repository}\nIssue: {issue}\nBranch: agent/{issue}\nBase branch: {base_branch}\nWorkspace: {workspace}")
+
+    if agents_md:
+        sections.append(f"## Repository Instructions (AGENTS.md)\n{agents_md}")
+
+    if skills_text:
+        sections.append(f"## Skills\n{skills_text}")
+
+    sections.append(f"## Task\n{task}")
+
+    sections.append("## Workflow\nFollow the system prompt workflow. Do not skip validation. Inspect the diff before committing.")
+
+    log.info("Context built issue=%s agents_md=%s skills=%s", issue, bool(agents_md), skill_names)
+
+    return "\n\n".join(sections)
+
 
 class AgentRunner:
     def __init__(self, settings: Settings): self.settings = settings
@@ -64,7 +107,7 @@ class AgentRunner:
         workspace = await manager.prepare(repository, issue, base_branch)
         log.info("Agent runner started run_id=%s issue=%s workspace=%s", run_id, issue, workspace)
         await activity("inspecting repository")
-        context = f"Issue: {issue}\nRepository: {repository}\nBase branch: {base_branch}\nWorkspace: {workspace}\n"
+        context = build_context(task, issue, repository, workspace, base_branch, issue_id)
         registry = build_registry(self.settings, workspace)
         result = await AgentLoop(NeuronClient(self.settings.neuron_base_url,self.settings.neuron_api_key,self.settings.neuron_model,self.settings.http_timeout_seconds), registry, self.settings.agent_max_iterations).run(task, context, lambda tool: activity(f"running {tool}"))
         result.update({"run_id":run_id,"workspace":str(workspace),"branch":f"agent/{issue}"})
