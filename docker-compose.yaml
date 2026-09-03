@@ -1,7 +1,0 @@
-services:
-  coding-agent:
-    build: .
-    environment:
-      NEURON_API_KEY: ${NEURON_API_KEY}
-      NEURON_BASE_URL: https://neuron.noser.com/v1
-      NEURON_MODEL: gpt-4.1

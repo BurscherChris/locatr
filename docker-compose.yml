@@ -1,0 +1,16 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      NEURON_API_KEY: ${NEURON_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_WEBHOOK_SECRET: ${LINEAR_WEBHOOK_SECRET:-}
+    volumes:
+      - agent-workspaces:/workspaces
+volumes:
+  agent-workspaces:
