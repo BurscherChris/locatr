@@ -10,7 +10,11 @@ from app.agent.governance import (
 )
 from app.agent.instructions import load_agents_md
 from app.agent.loop import AgentLoop
-from app.agent.skills import load_skills, relevant_skills_for_repository
+from app.agent.skills import (
+    load_agent_skills,
+    load_repository_skills,
+    detect_technologies,
+)
 from app.config import Settings
 from app.errors import ToolExecutionError
 from app.github.client import GitHubClient
@@ -76,20 +80,51 @@ def build_registry(settings: Settings, workspace, governance: GovernanceState, i
 
 
 def build_context(task: str, issue: str, repository: str, workspace: Path, base_branch: str, issue_id: str | None) -> str:
+    """Build the layered agent context from discovered repository information.
+
+    Sections (in order):
+      1. Repository — workspace metadata (always present)
+      2. Repository Instructions — AGENTS.md (if present)
+      3. Detected Technologies — technology indicators (if any)
+      4. Repository Skills — repository-local skills (if any)
+      5. Agent Skills — agent-core workflow skills (always present)
+      6. Task — the Linear issue (always present)
+
+    Agent-core skills (core, testing, git, github, governance) are always loaded.
+    Repository-local skills are discovered from the workspace.
+    The agent does NOT assume any technology for the target repository.
+    """
     agents_md = load_agents_md(workspace, issue)
-    skill_names = relevant_skills_for_repository(repository, task)
-    loaded = load_skills(skill_names)
-    skills_text = "\n\n".join(loaded.values())
+    technologies = detect_technologies(workspace)
+    repo_skills = load_repository_skills(workspace)
+    agent_skills = load_agent_skills()
+    all_skills = {}
+    all_skills.update(agent_skills)
+    all_skills.update(repo_skills)
+    skills_text = "\n\n".join(all_skills.values())
+
     sections = []
     sections.append(f"## Repository\nRepository: {repository}\nIssue: {issue}\nBranch: agent/{issue}\nBase branch: {base_branch}\nWorkspace: {workspace}")
+
     if agents_md:
         sections.append(f"## Repository Instructions (AGENTS.md)\n{agents_md}")
-    if skills_text:
-        sections.append(f"## Skills\n{skills_text}")
+
+    if technologies:
+        sections.append(f"## Detected Technologies\n{', '.join(technologies)}")
+
+    if agent_skills:
+        sections.append(f"## Agent Skills\n{'\n\n'.join(agent_skills.values())}")
+
+    if repo_skills:
+        sections.append(f"## Repository Skills\n{'\n\n'.join(repo_skills.values())}")
+
     sections.append(f"## Task\n{task}")
+
     sections.append("## Workflow\nFollow the system prompt workflow. Do not skip validation. Inspect the diff before committing.")
-    log.info("Context built issue=%s agents_md=%s skills_loaded=%s loaded_skill_names=%s",
-             issue, bool(agents_md), len(loaded), list(loaded.keys()))
+
+    log.info("Context built issue=%s agents_md=%s technologies=%s repo_skills=%s agent_skills=%s",
+             issue, bool(agents_md), technologies, list(repo_skills.keys()), list(agent_skills.keys()))
+
     return "\n\n".join(sections)
 
 
