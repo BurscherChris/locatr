@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     linear_oauth_actor: str = "app"
     linear_token_store_path: str = "/data/linear_tokens.json"
     github_repo: str = ""
+    slack_bot_token: str = ""
+    slack_signing_secret: str = ""
+    slack_ticket_proposal_store_path: str = "/data/slack_proposals.json"
     agent_max_iterations: int = Field(default=50, ge=1, le=200)
     workspace_root: str = "/workspaces"
     command_timeout_seconds: int = Field(default=120, ge=1, le=3600)

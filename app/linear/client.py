@@ -43,6 +43,11 @@ class LinearClient:
 
     async def update_issue(self, issue_id: str, state_id: str | None = None, description: str | None = None) -> dict:
         return await self.execute("mutation($id:String!,$input:IssueUpdateInput!){issueUpdate(id:$id,input:$input){success}}", {"id": issue_id, "input": {k:v for k,v in {"stateId":state_id,"description":description}.items() if v is not None}})
+    async def create_issue(self, team_id: str, title: str, description: str, priority: int | None = None) -> dict:
+        input_data = {"teamId": team_id, "title": title, "description": description}
+        if priority is not None:
+            input_data["priority"] = priority
+        return await self.execute("mutation($input:IssueCreateInput!){issueCreate(input:$input){success issue{id identifier url}}}", {"input": input_data})
     async def add_comment(self, issue_id: str, body: str) -> dict:
         return await self.execute("mutation($issueId:String!,$body:String!){commentCreate(input:{issueId:$issueId,body:$body}){success}}", {"issueId":issue_id,"body":body})
     async def add_activity(self, issue_id: str, content: str) -> dict:
