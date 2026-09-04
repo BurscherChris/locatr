@@ -342,13 +342,28 @@ class AgentRunner:
         await activity("inspecting repository")
         context = build_context(task, issue, repository, workspace, base_branch, issue_id)
         registry = build_registry(self.settings, workspace, governance)
+
+        async def completion_check(messages: list) -> tuple[bool, str]:
+            """Called by AgentLoop when the model returns text-only.
+            Returns (passed, message) — if not passed, the message is
+            fed back to the model and the loop continues."""
+            try:
+                verification = await verify_completion(workspace, issue, self.settings, governance)
+                if verification.get("status") == "awaiting_approval":
+                    return True, ""
+                if verification.get("changes_present") or verification.get("commits_present"):
+                    return True, ""
+                return False, f"Completion gate not satisfied: changes_present={verification.get('changes_present')}, push_ok={verification.get('push_ok')}"
+            except ToolExecutionError as exc:
+                return False, str(exc)
+
         loop_result = await AgentLoop(
             NeuronClient(
                 self.settings.neuron_base_url, self.settings.neuron_api_key,
                 self.settings.neuron_model, self.settings.http_timeout_seconds,
             ),
             registry, self.settings.agent_max_iterations,
-        ).run(task, context, lambda tool: activity(f"running {tool}"))
+        ).run(task, context, lambda tool: activity(f"running {tool}"), completion_check=completion_check)
 
         result = dict(loop_result)
         result.update({
@@ -358,6 +373,7 @@ class AgentRunner:
             "governance": governance.mode.value,
         })
 
+        # Final verification for reporting purposes (loop already ensured completion gate passed)
         try:
             verification = await verify_completion(workspace, issue, self.settings, governance)
             result["verification"] = verification
@@ -375,9 +391,9 @@ class AgentRunner:
         except Exception as exc:
             log.warning("Completion gate unexpected error (non-fatal): %s", exc)
 
-        if issue_id and verification and verification.get("pr_url"):
+        if issue_id and result.get("verification") and result["verification"].get("pr_url"):
             try:
-                await activity(f"PR created: {verification['pr_url']}")
+                await activity(f"PR created: {result['verification']['pr_url']}")
             except Exception:
                 pass
 
