@@ -22,7 +22,12 @@ class NeuronClient:
                 response.raise_for_status()
                 data = response.json()
                 if not data.get("choices"): raise NeuronError("Neuron returned no choices")
-                return data["choices"][0]["message"]
+                choice = data["choices"][0]
+                message = dict(choice["message"])
+                # Surface finish_reason so the loop can distinguish tool_calls vs stop.
+                # It is stripped before the message is sent back to Neuron.
+                message["_finish_reason"] = choice.get("finish_reason", "unknown")
+                return message
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt == 2: raise NeuronError(f"Neuron request failed: {exc}") from exc
                 await asyncio.sleep(0.25 * (2 ** attempt))

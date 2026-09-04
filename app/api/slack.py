@@ -1,5 +1,6 @@
 """Slack webhook and interaction endpoints."""
 
+import asyncio
 import json
 import logging
 
@@ -61,30 +62,39 @@ async def slack_webhook(
     x_slack_request_timestamp: str | None = Header(default=None, alias="x-slack-request-timestamp"),
     x_slack_signature: str | None = Header(default=None, alias="x-slack-signature"),
 ):
+    body = await request.body()
+    body_str = body.decode(errors="replace")
+
+    # ── URL verification (always works, no config/signature required) ─
+    # Slack sends url_verification without signature headers. Detect by
+    # checking the raw body text before any config or signature check.
+    if '"type":"url_verification"' in body_str or '"type": "url_verification"' in body_str:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="malformed payload")
+        challenge = payload.get("challenge", "")
+        if not challenge:
+            raise HTTPException(status_code=400, detail="missing challenge")
+        log.info("Slack URL verification challenge=%s", challenge[:20])
+        return {"challenge": challenge}
+
+    # ── Configuration check ───────────────────────────────────────────
     s = get_settings()
     if not s.slack_signing_secret or not s.slack_bot_token:
         raise HTTPException(status_code=501, detail="Slack integration not configured")
 
-    body = await request.body()
-
-    # Signature verification
+    # ── Signature verification ────────────────────────────────────────
     try:
         verify_slack_signature(s.slack_signing_secret, body, x_slack_request_timestamp or "", x_slack_signature or "")
     except WebhookValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Parse payload
+    # Parse payload for event callbacks
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="malformed payload")
-
-    # ── URL verification ────────────────────────────────────────────
-    if payload.get("type") == "url_verification":
-        challenge = payload.get("challenge", "")
-        return {"challenge": challenge}
-
-    # ── Event callbacks ─────────────────────────────────────────────
     event = payload.get("event") or {}
     event_id = payload.get("event_id") or payload.get("event_ts", "")
     team_id = payload.get("team_id", "")
@@ -159,13 +169,136 @@ async def slack_webhook(
     proposal = await store.create(channel, source_ts, ts, ticket_data)
 
     # ── Post proposal to Slack ──────────────────────────────────────
-    blocks = build_proposal_blocks(ticket_data)
+    blocks = build_proposal_blocks(ticket_data, proposal_id=proposal.proposal_id, thread_ts=source_ts)
     try:
         await slack.post_message(channel, "Linear Ticket Vorschlag", thread_ts=source_ts, blocks=blocks)
     except Exception as exc:
         log.error("Failed to post proposal: %s", exc)
 
     return {"status": "ok"}
+
+
+def _parse_interaction(body: bytes) -> dict:
+    """Parse Slack's URL-encoded interaction payload."""
+    import urllib.parse
+    try:
+        parsed = urllib.parse.parse_qs(body.decode())
+        payload_str = parsed.get("payload", [None])[0]
+        if not payload_str:
+            raise HTTPException(status_code=400, detail="missing payload")
+        return json.loads(payload_str)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid payload: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid payload: {exc}") from exc
+
+
+# ── Interaction idempotency set (in-memory, keyed on interaction + action) ──
+_processed_interactions: set[str] = set()
+
+
+def _build_ack_blocks(title: str, summary: str, priority: str, status_emoji: str, status_text: str) -> list[dict]:
+    """Build replacement blocks that remove action buttons and show a status."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*🧠 Linear Ticket Vorschlag*\n\n*Titel:*\n{title}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Zusammenfassung:*\n{summary}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Priorität:* {priority.capitalize()}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Status:* {status_emoji} {status_text}"}},
+    ]
+
+
+async def _handle_cancel_proposal(
+    slack: SlackClient,
+    store: ProposalStore,
+    channel: str,
+    message_ts: str,
+    proposal_id: str,
+    ticket_data: dict,
+) -> None:
+    """Cancel a proposal and update the Slack message."""
+    title = ticket_data.get("title", "?")
+    summary = ticket_data.get("summary", "")
+    priority = ticket_data.get("priority", "medium")
+    blocks = _build_ack_blocks(title, summary, priority, "❌", "Erstellung abgebrochen")
+    try:
+        await slack.update_message(channel, message_ts, "❌ Ticket-Erstellung abgebrochen.", blocks=blocks)
+    except Exception as exc:
+        log.warning("Failed to update Slack message after cancel: %s", exc)
+    await store.update_status(proposal_id, PROPOSAL_STATUS_CANCELLED)
+    log.info("Proposal cancelled id=%s", proposal_id)
+
+
+async def _handle_create_linear_issue(
+    slack: SlackClient,
+    store: ProposalStore,
+    channel: str,
+    message_ts: str,
+    proposal_id: str,
+    ticket_data: dict,
+    linear: LinearClient,
+) -> None:
+    """Create a Linear issue and update the Slack message.
+
+    Idempotent: re-fetches the proposal from the store so that concurrent
+    invocations for the same *proposal_id* see an up-to-date status.
+    """
+    proposal = await store.get(proposal_id)
+    if proposal and proposal.status == PROPOSAL_STATUS_CREATED:
+        log.info("Proposal already created id=%s url=%s", proposal_id, proposal.linear_issue_url)
+        title = proposal.ticket_data.get("title", "?")
+        summary = proposal.ticket_data.get("summary", "")
+        priority = proposal.ticket_data.get("priority", "medium")
+        blocks = _build_ack_blocks(title, summary, priority, "✅", f"Linear Ticket erstellt: {proposal.linear_issue_url or proposal.linear_issue_id}")
+        await slack.update_message(channel, message_ts, f"✅ Linear Ticket bereits erstellt: {proposal.linear_issue_url or proposal.linear_issue_id}", blocks=blocks)
+        return
+    ticket_data = proposal.ticket_data if proposal else ticket_data
+
+    title = ticket_data.get("title", "Untitled")
+    summary = ticket_data.get("summary", "")
+    priority = ticket_data.get("priority", "medium")
+
+    # ── Resolve Linear team ────────────────────────────────────────
+    try:
+        team_result = await linear.execute("query{teams{nodes{id name}}}", {})
+        teams = (team_result.get("teams") or {}).get("nodes") or []
+        if not teams:
+            blocks = _build_ack_blocks(title, summary, priority, "❌", "Kein Linear-Team gefunden")
+            await slack.update_message(channel, message_ts, "❌ Kein Linear-Team gefunden.", blocks=blocks)
+            await store.update_status(proposal_id, PROPOSAL_STATUS_FAILED)
+            return
+        team_id = teams[0]["id"]
+    except Exception as exc:
+        log.warning("Failed to resolve Linear team: %s", exc)
+        blocks = _build_ack_blocks(title, summary, priority, "❌", "Linear-Team konnte nicht ermittelt werden")
+        await slack.update_message(channel, message_ts, "❌ Linear-Team konnte nicht ermittelt werden.", blocks=blocks)
+        await store.update_status(proposal_id, PROPOSAL_STATUS_FAILED)
+        return
+
+    # ── Build description ──────────────────────────────────────────
+    description = (
+        f"## Summary\n{ticket_data.get('summary', '')}\n\n"
+        f"## Problem\n{ticket_data.get('problem', '')}\n\n"
+        f"## Proposed Solution\n{ticket_data.get('proposed_solution', '')}\n\n"
+        f"## Acceptance Criteria\n" + "\n".join(f"- {c}" for c in ticket_data.get('acceptance_criteria', [])) + "\n\n"
+        f"## Source\nSlack thread"
+    )
+    linear_priority = slack_priority_to_linear(ticket_data.get("priority", "medium"))
+
+    # ── Create issue ───────────────────────────────────────────────
+    try:
+        result = await linear.create_issue(team_id, title, description, linear_priority)
+        issue_data = (result.get("issueCreate") or {}).get("issue") or {}
+        issue_id = issue_data.get("identifier", "")
+        issue_url = issue_data.get("url", "")
+        await store.update_status(proposal_id, PROPOSAL_STATUS_CREATED, issue_id, issue_url)
+        blocks = _build_ack_blocks(title, summary, priority, "✅", f"Linear Ticket erstellt: {issue_url or issue_id}")
+        await slack.update_message(channel, message_ts, f"✅ Linear Ticket erstellt: {issue_url or issue_id}", blocks=blocks)
+        log.info("Linear issue created id=%s proposal=%s", issue_id, proposal_id)
+    except Exception as exc:
+        log.warning("Linear issue creation failed: %s", exc)
+        blocks = _build_ack_blocks(title, summary, priority, "❌", "Linear Ticket konnte nicht erstellt werden")
+        await slack.update_message(channel, message_ts, "❌ Linear Ticket konnte nicht erstellt werden.", blocks=blocks)
+        await store.update_status(proposal_id, PROPOSAL_STATUS_FAILED)
 
 
 @router.post("/webhooks/slack/interactions")
@@ -185,17 +318,7 @@ async def slack_interactions(
     except WebhookValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Slack sends interactions as URL-encoded form data
-    import urllib.parse
-    try:
-        parsed = urllib.parse.parse_qs(body.decode())
-        payload_str = parsed.get("payload", [None])[0]
-        if not payload_str:
-            raise HTTPException(status_code=400, detail="missing payload")
-        payload = json.loads(payload_str)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid payload: {exc}") from exc
-
+    payload = _parse_interaction(body)
     actions = payload.get("actions") or []
     if not actions:
         return {"status": "ok"}
@@ -203,86 +326,69 @@ async def slack_interactions(
     action_id = actions[0].get("action_id", "")
     channel = (payload.get("channel") or {}).get("id", "")
     message_ts = (payload.get("message") or {}).get("ts", "")
-    # Find the proposal by reconstructing context from the interaction
-    # The proposal_id is in the action value for create_linear_issue
     action_value = actions[0].get("value", "")
 
-    slack = _get_slack_client()
-    if not slack:
-        log.warning("Slack client not available for interaction")
+    # ── Idempotency ──────────────────────────────────────────────────
+    # Slack interaction payload has a unique hash or use channel+message_ts+action_id
+    interaction_id = payload.get("hash", "") or f"{channel}:{message_ts}:{action_id}"
+    if interaction_id in _processed_interactions:
+        log.info("Interaction already processed id=%s", interaction_id)
         return {"status": "ok"}
+    _processed_interactions.add(interaction_id)
+
+    # ── Extract proposal_id and thread_ts from button value ──────────
+    proposal_id = ""
+    thread_ts = ""
+    if action_value:
+        try:
+            meta = json.loads(action_value)
+            proposal_id = meta.get("proposal_id", "")
+            thread_ts = meta.get("thread_ts", "")
+        except (json.JSONDecodeError, TypeError):
+            proposal_id = action_value  # fallback: value is the proposal_id itself
+
+    # ── Immediate acknowledgement to Slack ───────────────────────────
+    # Return 200 immediately. The actual work is done in the background.
+    # (Slack expects a 200 within 3 seconds; Linear operations may take longer.)
+
+    slack = _get_slack_client()
+    linear = _get_linear_client()
 
     if action_id == "cancel_proposal":
-        # Find and cancel the most recent pending proposal for this thread
-        # (we use channel+message_ts of the proposal message)
         store = _get_store()
-        # The message_ts of the proposal message isn't directly linked — find by channel+thread
-        # Since we don't have the thread_ts in the interaction payload, we use a simpler approach:
-        # just mark as cancelled and update the message
-        await slack.update_message(channel, message_ts, "❌ Ticket-Erstellung abgebrochen.")
+        proposal = await store.get(proposal_id) if proposal_id else None
+        if not proposal:
+            # Fallback: find pending proposal for this channel
+            all_proposals = [p for p in (await store._load()).values()
+                             if p.slack_channel_id == channel and p.status == PROPOSAL_STATUS_PENDING]
+            if all_proposals:
+                proposal = all_proposals[-1]
+        ticket_data = proposal.ticket_data if proposal else {"title": "?", "summary": "", "priority": "medium"}
+        actual_pid = proposal.proposal_id if proposal else proposal_id
+        asyncio.create_task(_handle_cancel_proposal(slack, store, channel, message_ts, actual_pid, ticket_data))
         return {"status": "ok"}
 
     if action_id == "create_linear_issue":
-        linear = _get_linear_client()
         if not linear:
             await slack.update_message(channel, message_ts, "❌ Linear-Client nicht verfügbar.")
             return {"status": "ok"}
 
-        # Find the proposal — the interaction doesn't carry the proposal_id directly
-        # so we need to find it. The proposal was created for this channel+thread.
-        # We stored the proposal with the channel and thread_ts from the original message.
-        # The interaction payload has channel but not thread_ts directly.
-        # As a workaround, find the latest pending proposal for this channel.
         store = _get_store()
-        # Since we can't easily correlate, use a simple approach:
-        # cancel any other pending proposals for this channel and create the issue
-        # from the most recent one
-        proposal = await store.find_by_thread(channel, "")
-        if proposal is None:
-            await slack.update_message(channel, message_ts, "❌ Kein ausstehender Vorschlag gefunden.")
-            return {"status": "ok"}
-
-        if proposal.status == PROPOSAL_STATUS_CREATED:
-            await slack.update_message(channel, message_ts, f"✅ Linear Ticket bereits erstellt: {proposal.linear_issue_url}")
-            return {"status": "ok"}
-
-        # Determine the Linear team ID from config or issue
-        # For now use the first team available from Linear
-        try:
-            team_result = await linear.execute("query{teams{nodes{id name}}}", {})
-            teams = (team_result.get("teams") or {}).get("nodes") or []
-            if not teams:
-                await slack.update_message(channel, message_ts, "❌ Kein Linear-Team gefunden.")
-                await store.update_status(proposal.proposal_id, PROPOSAL_STATUS_FAILED)
+        proposal = await store.get(proposal_id) if proposal_id else None
+        if not proposal:
+            all_proposals = [p for p in (await store._load()).values()
+                             if p.slack_channel_id == channel and p.status == PROPOSAL_STATUS_PENDING]
+            if not all_proposals:
+                await slack.update_message(channel, message_ts, "❌ Kein ausstehender Vorschlag gefunden.")
                 return {"status": "ok"}
-            team_id = teams[0]["id"]
-        except Exception as exc:
-            log.warning("Failed to resolve Linear team: %s", exc)
-            slack.update_message(channel, message_ts, "❌ Linear-Team konnte nicht ermittelt werden.")
-            return {"status": "ok"}
+            proposal = all_proposals[-1]
 
-        ticket = proposal.ticket_data
-        description = (
-            f"## Summary\n{ticket.get('summary', '')}\n\n"
-            f"## Problem\n{ticket.get('problem', '')}\n\n"
-            f"## Proposed Solution\n{ticket.get('proposed_solution', '')}\n\n"
-            f"## Acceptance Criteria\n" + "\n".join(f"- {c}" for c in ticket.get('acceptance_criteria', [])) + "\n\n"
-            f"## Source\nSlack thread"
+        ticket_data = proposal.ticket_data
+        actual_pid = proposal.proposal_id
+
+        asyncio.create_task(
+            _handle_create_linear_issue(slack, store, channel, message_ts, actual_pid, ticket_data, linear)
         )
-        linear_priority = slack_priority_to_linear(ticket.get("priority", "medium"))
-
-        try:
-            result = await linear.create_issue(team_id, ticket["title"], description, linear_priority)
-            issue_data = (result.get("issueCreate") or {}).get("issue") or {}
-            issue_id = issue_data.get("identifier", "")
-            issue_url = issue_data.get("url", "")
-            await store.update_status(proposal.proposal_id, PROPOSAL_STATUS_CREATED, issue_id, issue_url)
-            await slack.update_message(channel, message_ts, f"✅ Linear Ticket erstellt: {issue_url or issue_id}")
-        except Exception as exc:
-            log.warning("Linear issue creation failed: %s", exc)
-            await slack.update_message(channel, message_ts, "❌ Linear Ticket konnte nicht erstellt werden.")
-            await store.update_status(proposal.proposal_id, PROPOSAL_STATUS_FAILED)
-
         return {"status": "ok"}
 
     return {"status": "ok"}

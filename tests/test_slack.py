@@ -99,25 +99,37 @@ class TestTriggerDetection:
 # ---------------------------------------------------------------------------
 
 class TestSlackWebhook:
-    def test_url_verification(self, monkeypatch):
-        monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
-        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
-        get_settings.cache_clear()
+    def _unconfigured(self, monkeypatch):
+        """Mock get_settings to return config with no Slack credentials."""
+        from app.config import Settings
+        def mock_settings():
+            return Settings(slack_signing_secret="", slack_bot_token="")
+        monkeypatch.setattr("app.api.slack.get_settings", mock_settings)
 
-        body = json.dumps({"type": "url_verification", "challenge": "challengestring"}).encode()
-        sig, ts = _slack_sig(body)
+    def test_url_verification_no_config_no_signature(self, monkeypatch):
+        self._unconfigured(monkeypatch)
+        body = json.dumps({"type": "url_verification", "challenge": "challenge_abc123"}).encode()
         with TestClient(app) as client:
-            resp = client.post("/webhooks/slack", content=body, headers={
-                "x-slack-request-timestamp": ts,
-                "x-slack-signature": sig,
-            })
+            resp = client.post("/webhooks/slack", content=body)
             assert resp.status_code == 200
-            assert resp.json()["challenge"] == "challengestring"
+            assert resp.json()["challenge"] == "challenge_abc123"
+
+    def test_url_verification_missing_challenge(self, monkeypatch):
+        self._unconfigured(monkeypatch)
+        body = json.dumps({"type": "url_verification"}).encode()
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/slack", content=body)
+            assert resp.status_code == 400
+
+    def test_url_verification_wrong_type(self, monkeypatch):
+        self._unconfigured(monkeypatch)
+        body = json.dumps({"type": "event_callback", "challenge": "x"}).encode()
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/slack", content=body)
+            assert resp.status_code == 501
 
     def test_missing_config_returns_501(self, monkeypatch):
-        monkeypatch.delenv("SLACK_SIGNING_SECRET", raising=False)
-        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-        get_settings.cache_clear()
+        self._unconfigured(monkeypatch)
         with TestClient(app) as client:
             resp = client.post("/webhooks/slack", content=b"{}")
             assert resp.status_code == 501

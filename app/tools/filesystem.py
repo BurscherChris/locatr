@@ -16,14 +16,22 @@ class FilesystemTools:
         return {"path": str(target.relative_to(self.workspace)), "bytes": len(content.encode())}
     async def list_files(self, path: str = ".") -> dict:
         target = safe_path(self.workspace, path)
-        if not target.is_dir(): raise ToolExecutionError("directory does not exist")
-        files = [str(item.relative_to(self.workspace)) for item in sorted(target.iterdir())[:500] if item.name not in {".git", ".env"}]
-        return {"files": files}
+        if target.is_file():
+            raise ToolExecutionError(f"'{path}' is a file, not a directory. Use read_file to read its content.")
+        if not target.is_dir():
+            raise ToolExecutionError(f"directory '{path}' does not exist")
+        entries = sorted(target.iterdir())[:500]
+        files = [str(item.relative_to(self.workspace)) for item in entries if item.is_file() and item.name not in {".env"}]
+        dirs = [str(item.relative_to(self.workspace)) + "/" for item in entries if item.is_dir() and item.name not in {".git"}]
+        return {"files": files, "directories": dirs}
     async def search_code(self, query: str, path: str = ".") -> dict:
         target = safe_path(self.workspace, path)
-        if not target.is_dir(): raise ToolExecutionError("directory does not exist")
+        if not target.exists():
+            raise ToolExecutionError(f"path '{path}' does not exist")
         matches = []
-        for item in target.rglob("*"):
+        # Support both single-file and directory search
+        candidates = [target] if target.is_file() else target.rglob("*")
+        for item in candidates:
             if len(matches) >= 100: break
             if not item.is_file() or ".git" in item.parts or item.stat().st_size > 1_000_000: continue
             try:
@@ -32,4 +40,4 @@ class FilesystemTools:
                         matches.append({"path":str(item.relative_to(self.workspace)),"line":number,"content":line[:500]})
                         if len(matches) >= 100: break
             except OSError: continue
-        return {"matches":matches}
+        return {"matches":matches, "searched": str(target.relative_to(self.workspace)), "query": query}

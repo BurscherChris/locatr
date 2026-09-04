@@ -237,8 +237,13 @@ def slack_priority_to_linear(priority: str) -> int:
 
 # ── Proposal block builder for Slack ───────────────────────────────
 
-def build_proposal_blocks(ticket: dict) -> list[dict]:
-    """Build Slack Block Kit blocks for a ticket proposal."""
+def build_proposal_blocks(ticket: dict, proposal_id: str = "", thread_ts: str = "") -> list[dict]:
+    """Build Slack Block Kit blocks for a ticket proposal.
+
+    Embeds *proposal_id* and *thread_ts* into each button's *value* so the
+    interactions endpoint can correlate the click back to the correct proposal.
+    The value is a JSON object: ``{"proposal_id":"…","thread_ts":"…"}``.
+    """
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*🧠 Linear Ticket Vorschlag*\n\n*Titel:*\n{ticket['title']}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Zusammenfassung:*\n{ticket['summary']}"}},
@@ -254,11 +259,12 @@ def build_proposal_blocks(ticket: dict) -> list[dict]:
         questions_text = "\n".join(f"• {q}" for q in ticket["open_questions"])
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Offene Fragen:*\n{questions_text}"}})
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Priorität:* {ticket['priority'].capitalize()}"}})
+    action_value = json.dumps({"proposal_id": proposal_id, "thread_ts": thread_ts})
     blocks.append({
         "type": "actions",
         "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "Create Linear Issue"}, "style": "primary", "value": "create_linear_issue", "action_id": "create_linear_issue"},
-            {"type": "button", "text": {"type": "plain_text", "text": "Cancel"}, "style": "danger", "value": "cancel", "action_id": "cancel_proposal"},
+            {"type": "button", "text": {"type": "plain_text", "text": "Create Linear Issue"}, "style": "primary", "value": action_value, "action_id": "create_linear_issue"},
+            {"type": "button", "text": {"type": "plain_text", "text": "Cancel"}, "style": "danger", "value": action_value, "action_id": "cancel_proposal"},
         ],
     })
     return blocks

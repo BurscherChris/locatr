@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from app.errors import ToolExecutionError
@@ -7,7 +8,7 @@ class ToolResult:
     ok: bool
     data: Any = None
     error: str | None = None
-    def message(self) -> str: return str({"ok": self.ok, "data": self.data} if self.ok else {"ok": False, "error": self.error})
+    def message(self) -> str: return json.dumps({"ok": self.ok, "data": self.data} if self.ok else {"ok": False, "error": self.error})
 
 class Tool:
     def __init__(self, name: str, description: str, parameters: dict, execute: Callable[..., Awaitable[Any]]): self.name, self.description, self.parameters, self.execute = name, description, parameters, execute
