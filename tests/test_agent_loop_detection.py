@@ -566,3 +566,101 @@ async def test_list_files_returns_directories_separately(tmp_path):
     result = await fs.list_files(".")
     assert "a.ts" in result["files"]
     assert "sub/" in result["directories"]
+
+
+# ======================================================================
+# TEST 16: Repository tree in initial context
+# ======================================================================
+
+
+def test_build_repository_tree_includes_files_and_skips_noise(tmp_path):
+    from app.agent.runner import build_repository_tree
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "page.tsx").write_text("x")
+    (tmp_path / "components").mkdir()
+    (tmp_path / "components" / "button.tsx").write_text("x")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "react").mkdir()
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".env").write_text("SECRET=x")
+    tree = build_repository_tree(tmp_path)
+    assert "app/page.tsx" in tree
+    assert "components/button.tsx" in tree
+    assert "node_modules" not in tree
+    assert ".git" not in tree
+    assert ".env" not in tree
+
+
+def test_build_context_contains_file_tree(tmp_path):
+    from app.agent.runner import build_context
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.ts").write_text("x")
+    ctx = build_context("task", "T-1", "https://x/y.git", tmp_path, "main", None)
+    assert "## Repository File Tree" in ctx
+    assert "src/main.ts" in ctx
+
+
+# ======================================================================
+# TEST 17: Exploration nudge fires after 8 consecutive read-only calls
+# ======================================================================
+
+
+@pytest.mark.asyncio
+async def test_exploration_nudge_injected(tmp_path):
+    """After 8 consecutive read-only calls with no writes a runtime notice is added."""
+    for i in range(10):
+        (tmp_path / f"f{i}.txt").write_text("x")
+    reads = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": f"c{i}", "type": "function",
+                         "function": {"name": "read_file", "arguments": json.dumps({"path": f"f{i}.txt"})}}]}
+        for i in range(8)
+    ]
+    neuron = ScriptedNeuron(reads + [{"role": "assistant", "content": "done"}])
+    captured = []
+    orig = neuron.complete
+
+    async def cap(messages, tools):
+        captured.append([dict(m) for m in messages])
+        return await orig(messages, tools)
+
+    neuron.complete = cap
+    await AgentLoop(neuron, _registry(tmp_path), 20).run("task", "ctx")
+    # The 9th neuron call (index 8) should see the runtime notice appended after 8 reads
+    final_batch = captured[-1]
+    notices = [m for m in final_batch if m.get("role") == "user" and "[Runtime notice]" in (m.get("content") or "")]
+    assert len(notices) == 1
+    assert "8 consecutive read-only" in notices[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_no_nudge_when_writes_happen(tmp_path):
+    """If the model writes a file the read-only streak resets and no nudge fires."""
+    for i in range(5):
+        (tmp_path / f"a{i}.txt").write_text("x")
+    calls = []
+    for i in range(5):
+        calls.append({"role": "assistant", "content": None,
+                      "tool_calls": [{"id": f"r{i}", "type": "function",
+                                      "function": {"name": "read_file", "arguments": json.dumps({"path": f"a{i}.txt"})}}]})
+    calls.append({"role": "assistant", "content": None,
+                  "tool_calls": [{"id": "w", "type": "function",
+                                  "function": {"name": "write_file", "arguments": '{"path": "out.txt", "content": "y"}'}}]})
+    for i in range(5):
+        calls.append({"role": "assistant", "content": None,
+                      "tool_calls": [{"id": f"r2{i}", "type": "function",
+                                      "function": {"name": "read_file", "arguments": json.dumps({"path": f"a{i}.txt"})}}]})
+    calls.append({"role": "assistant", "content": "done"})
+    neuron = ScriptedNeuron(calls)
+    captured = []
+    orig = neuron.complete
+
+    async def cap(messages, tools):
+        captured.append([dict(m) for m in messages])
+        return await orig(messages, tools)
+
+    neuron.complete = cap
+    await AgentLoop(neuron, _registry(tmp_path), 30).run("task", "ctx")
+    all_msgs = [m for batch in captured for m in batch]
+    notices = [m for m in all_msgs if m.get("role") == "user" and "[Runtime notice]" in (m.get("content") or "")]
+    assert not notices

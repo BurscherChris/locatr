@@ -82,7 +82,7 @@ class LoopState:
         if len(self.recent) > 20:
             self.recent.pop(0)
         if ok and name in (
-            "write_file", "git_commit", "git_push",
+            "write_file", "edit_file", "git_commit", "git_push",
             "git_create_branch", "create_pull_request",
         ):
             self.meaningful_changes += 1
@@ -133,6 +133,26 @@ class LoopState:
 
     def progress_warning(self) -> bool:
         return self.iteration > 20 and self.meaningful_changes == 0
+
+    # Read-only tools that do not change repository state
+    _READ_ONLY = frozenset({"list_files", "read_file", "search_code", "git_status", "git_diff", "git_log", "get_pull_request"})
+
+    def consecutive_read_only(self) -> int:
+        """Count how many consecutive most-recent calls were read-only."""
+        count = 0
+        for r in reversed(self.recent):
+            if r.name in self._READ_ONLY:
+                count += 1
+            else:
+                break
+        return count
+
+    def should_nudge_to_implement(self) -> bool:
+        """True when the model has explored for a long stretch without writing anything.
+        Fires once at each multiple of 8 consecutive read-only calls so the
+        nudge is repeated if the model ignores it, without spamming every iteration."""
+        n = self.consecutive_read_only()
+        return n >= 8 and n % 8 == 0 and self.meaningful_changes == 0
 
 
 # ── Main loop ──────────────────────────────────────────────────────────
@@ -255,7 +275,7 @@ class AgentLoop:
                                 f"{prior_repeats + 1} times. The result is identical to before. "
                                 "Do not repeat this call — use the information you already have "
                                 "to move forward with the task (e.g. read_file for a specific file, "
-                                "write_file to make changes, run_tests to validate)."
+                                "edit_file or write_file to make changes, run_tests to validate)."
                             ),
                         })
                         log.warning("ITERATION %s: injected repeat-warning into tool result for %s (repeats=%s)",
@@ -273,6 +293,26 @@ class AgentLoop:
                 if loop_msg:
                     log.error("ITERATION %s: loop detected: %s", iteration, loop_msg)
                     raise AgentIterationLimitError(f"agent loop detected: {loop_msg}")
+
+                # Exploration nudge: after 8+ consecutive read-only calls with no writes,
+                # tell the model it has enough context and must start implementing.
+                # This is a user-role message (not a tool result) so it reads as an
+                # instruction, and it is only injected periodically to avoid spam.
+                if state.should_nudge_to_implement():
+                    n = state.consecutive_read_only()
+                    remaining = self.max_iterations - iteration
+                    log.warning("ITERATION %s: exploration nudge (consecutive_read_only=%s remaining_iterations=%s)",
+                                iteration, n, remaining)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"[Runtime notice] You have made {n} consecutive read-only calls without "
+                            f"writing any file. You have {remaining} iterations left. The repository file "
+                            "tree was provided in the initial context — you already know the structure. "
+                            "Stop exploring and start implementing now: use edit_file to modify existing files or write_file to create "
+                            "the file(s) the task requires, then run_tests, then git_commit."
+                        ),
+                    })
 
             # ── Text response (no tool calls) ──────────────────────────
             else:

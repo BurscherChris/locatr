@@ -64,7 +64,10 @@ def build_registry(settings: Settings, workspace, governance: GovernanceState, i
     registry, fs = ToolRegistry(), FilesystemTools(workspace)
     shell, git = ShellTools(workspace, settings.allowed_commands, settings.denied_commands, settings.command_timeout_seconds), GitTools(workspace, settings.github_token, settings.command_timeout_seconds)
     for name, desc, schema, func in [
-        ("read_file","Read a workspace file",P({"path":S("relative path")},["path"]),fs.read_file), ("write_file","Write a workspace file",P({"path":S("relative path"),"content":S("complete content")},["path","content"]),fs.write_file), ("list_files","List workspace directory",P({"path":S("relative path")}),fs.list_files), ("search_code","Search text in code",P({"query":S("text"),"path":S("relative path")},["query"]),fs.search_code),
+        ("read_file","Read a workspace file",P({"path":S("relative path")},["path"]),fs.read_file),
+        ("write_file","Create a NEW file or completely replace a file's content. For modifying an existing file, prefer edit_file so unrelated code is not lost.",P({"path":S("relative path"),"content":S("complete file content")},["path","content"]),fs.write_file),
+        ("edit_file","Replace one exact section of an existing file. old_string must match exactly once (including whitespace). The rest of the file is untouched. Use this for modifications instead of rewriting whole files.",P({"path":S("relative path"),"old_string":S("exact text to replace — must be unique in the file"),"new_string":S("replacement text")},["path","old_string","new_string"]),fs.edit_file),
+        ("list_files","List workspace directory",P({"path":S("relative path")}),fs.list_files), ("search_code","Search text in code",P({"query":S("text"),"path":S("relative path")},["query"]),fs.search_code),
         ("run_command","Run an allowed development command",P({"command":S("command"),"timeout_seconds":{"type":"integer","minimum":1}},["command"]),shell.run_command), ("run_tests","Run tests",P({"command":S("test command")}),shell.run_tests),
         ("git_status","Show git status",P({}),git.git_status), ("git_diff","Show git diff",P({}),git.git_diff), ("git_log","Show commits",P({"limit":{"type":"integer","minimum":1,"maximum":50}}),git.git_log), ("git_create_branch","Create agent branch",P({"branch":S("branch")},["branch"]),git.git_create_branch), ("git_commit","Commit all changes",P({"message":S("commit message")},["message"]),git.git_commit), ("git_push","Push branch",P({"branch":S("branch")},["branch"]),git.git_push)]:
         # Wrap every tool with governance
@@ -77,6 +80,43 @@ def build_registry(settings: Settings, workspace, governance: GovernanceState, i
             wrapped = _governance_wrapper(func, name, governance)
             registry.register(Tool(name, desc, schema, wrapped))
     return registry
+
+
+_TREE_SKIP_DIRS = {".git", "node_modules", ".next", "dist", "build", "__pycache__", ".venv", "venv", ".idea", ".vscode", "coverage", ".turbo", ".cache"}
+_TREE_MAX_ENTRIES = 400
+
+
+def build_repository_tree(workspace: Path) -> str:
+    """Produce a compact recursive file tree of the workspace so the model can
+    orient itself in a single glance instead of exploring directory by directory.
+    Directories that never contain source code are skipped."""
+    lines: list[str] = []
+    count = 0
+
+    def walk(path: Path, prefix: str) -> None:
+        nonlocal count
+        try:
+            entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except (OSError, PermissionError):
+            return
+        for entry in entries:
+            if count >= _TREE_MAX_ENTRIES:
+                return
+            if entry.name in _TREE_SKIP_DIRS or entry.name.startswith(".env"):
+                continue
+            rel = str(entry.relative_to(workspace))
+            if entry.is_dir():
+                lines.append(f"{prefix}{rel}/")
+                count += 1
+                walk(entry, prefix)
+            else:
+                lines.append(f"{prefix}{rel}")
+                count += 1
+
+    walk(workspace, "")
+    if count >= _TREE_MAX_ENTRIES:
+        lines.append(f"... (truncated at {_TREE_MAX_ENTRIES} entries — use list_files for sub-directories)")
+    return "\n".join(lines)
 
 
 def build_context(task: str, issue: str, repository: str, workspace: Path, base_branch: str, issue_id: str | None) -> str:
@@ -98,13 +138,19 @@ def build_context(task: str, issue: str, repository: str, workspace: Path, base_
     technologies = detect_technologies(workspace)
     repo_skills = load_repository_skills(workspace)
     agent_skills = load_agent_skills()
-    all_skills = {}
-    all_skills.update(agent_skills)
-    all_skills.update(repo_skills)
-    skills_text = "\n\n".join(all_skills.values())
+    tree = build_repository_tree(workspace)
 
     sections = []
     sections.append(f"## Repository\nRepository: {repository}\nIssue: {issue}\nBranch: agent/{issue}\nBase branch: {base_branch}\nWorkspace: {workspace}")
+
+    # The full tree is given up-front so the model does NOT need to spend
+    # many iterations calling list_files just to understand the structure.
+    sections.append(
+        "## Repository File Tree\n"
+        "The complete file tree is listed below. Use read_file to inspect specific files. "
+        "Do NOT call list_files on directories shown here — the structure is already known.\n\n"
+        f"{tree}"
+    )
 
     if agents_md:
         sections.append(f"## Repository Instructions (AGENTS.md)\n{agents_md}")
@@ -122,8 +168,9 @@ def build_context(task: str, issue: str, repository: str, workspace: Path, base_
 
     sections.append("## Workflow\nFollow the system prompt workflow. Do not skip validation. Inspect the diff before committing.")
 
-    log.info("Context built issue=%s agents_md=%s technologies=%s repo_skills=%s agent_skills=%s",
-             issue, bool(agents_md), technologies, list(repo_skills.keys()), list(agent_skills.keys()))
+    log.info("Context built issue=%s agents_md=%s technologies=%s repo_skills=%s agent_skills=%s tree_lines=%s",
+             issue, bool(agents_md), technologies, list(repo_skills.keys()), list(agent_skills.keys()),
+             tree.count("\n") + 1 if tree else 0)
 
     return "\n\n".join(sections)
 

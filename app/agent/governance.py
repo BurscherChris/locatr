@@ -96,7 +96,7 @@ def priority_to_governance(linear_priority: int | None) -> GovernanceState:
 
 # ---- Tool names that are governed ----
 
-WRITE_TOOLS = {"write_file", "delete_file"}
+WRITE_TOOLS = {"write_file", "edit_file", "delete_file"}
 GIT_WRITE_TOOLS = {"git_commit", "git_push", "git_create_branch"}
 PR_TOOLS = {"create_pull_request"}
 MASTER_PUSH_INDICATORS = {"main", "master"}
