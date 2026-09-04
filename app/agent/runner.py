@@ -190,9 +190,10 @@ async def verify_completion(workspace: Path, issue: str, settings: Settings, gov
             checks["push_ok"] = False
 
     if not push_ok:
-        raise ToolExecutionError(
-            f"completion gate: branch agent/{issue} was not pushed to remote."
-        )
+        msg = f"completion gate: branch '{branch}' was not pushed to remote."
+        if is_low:
+            msg = "completion gate: master was not pushed to remote."
+        raise ToolExecutionError(msg)
 
     pr_url = ""
     if governance.requires_pr and settings.github_token:

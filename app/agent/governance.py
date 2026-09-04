@@ -100,9 +100,6 @@ WRITE_TOOLS = {"write_file", "delete_file"}
 GIT_WRITE_TOOLS = {"git_commit", "git_push", "git_create_branch"}
 PR_TOOLS = {"create_pull_request"}
 MASTER_PUSH_INDICATORS = {"main", "master"}
-BYPASS_TOOLS = {"read_file", "list_files", "search_code", "run_command", "run_tests",
-                "git_status", "git_diff", "git_log", "get_pull_request",
-                "add_linear_comment", "add_linear_activity", "update_linear_issue"}
 
 
 def check_tool_permitted(tool_name: str, arguments: dict, state: GovernanceState, branch: str = "") -> None:
@@ -110,9 +107,6 @@ def check_tool_permitted(tool_name: str, arguments: dict, state: GovernanceState
 
     Arguments are inspected only for branch names that indicate master push intent.
     """
-    if state.can_write_repository:
-        pass  # general write allowed
-
     if state.mode == GovernanceMode.AWAITING_APPROVAL:
         if tool_name in WRITE_TOOLS:
             raise ToolExecutionError(
@@ -127,6 +121,13 @@ def check_tool_permitted(tool_name: str, arguments: dict, state: GovernanceState
             raise ToolExecutionError(
                 f"governance: {tool_name} is not permitted while awaiting approval (HIGH priority)."
             )
+
+    # LOW priority must NOT create pull requests
+    if tool_name in PR_TOOLS and state.mode == GovernanceMode.AUTONOMOUS:
+        raise ToolExecutionError(
+            f"governance: {tool_name} is not permitted for LOW priority. "
+            "LOW priority changes are committed directly to master without a pull request."
+        )
 
     if tool_name == "git_push":
         target = arguments.get("branch", "")

@@ -139,6 +139,53 @@ class TestToolEnforcement:
         g = GovernanceState(GovernanceMode.AUTONOMOUS)
         check_tool_permitted("git_push", {"branch": "main"}, g)  # should not raise
 
+    def test_low_rejects_create_pr(self):
+        g = GovernanceState(GovernanceMode.AUTONOMOUS)
+        with pytest.raises(ToolExecutionError, match="not permitted"):
+            check_tool_permitted("create_pull_request", {"repository": "o/r", "title": "t", "head": "h", "base": "main", "body": "b"}, g)
+
+
+# ---------------------------------------------------------------------------
+# LOW priority specific tests
+# ---------------------------------------------------------------------------
+
+class TestLowPriority:
+    def test_low_works_on_master(self):
+        """LOW priority must work on master."""
+        g = GovernanceState(GovernanceMode.AUTONOMOUS)
+        # Must allow pushing master
+        check_tool_permitted("git_push", {"branch": "main"}, g)
+        # Must block create_pull_request
+        with pytest.raises(ToolExecutionError, match="not permitted"):
+            check_tool_permitted("create_pull_request", {"repository": "o/r", "title": "t", "head": "h", "base": "main", "body": "b"}, g)
+
+    def test_low_cannot_create_branch_that_blocks_master(self):
+        """LOW should not need branches, but creating a branch is not prohibited."""
+        g = GovernanceState(GovernanceMode.AUTONOMOUS)
+        check_tool_permitted("git_create_branch", {"branch": "agent/TEST-X"}, g)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority specific tests
+# ---------------------------------------------------------------------------
+
+class TestMediumPriority:
+    def test_medium_requires_branch_and_pr(self):
+        g = GovernanceState(GovernanceMode.PR_REQUIRED)
+        assert g.requires_pr is True
+        assert g.requires_branch is True
+        assert g.can_push_master is False
+        check_tool_permitted("git_push", {"branch": "agent/TEST-1"}, g)  # branch push ok
+
+    def test_medium_blocks_master_push(self):
+        g = GovernanceState(GovernanceMode.PR_REQUIRED)
+        with pytest.raises(ToolExecutionError):
+            check_tool_permitted("git_push", {"branch": "main"}, g)
+
+    def test_medium_allows_create_pr(self):
+        g = GovernanceState(GovernanceMode.PR_REQUIRED)
+        check_tool_permitted("create_pull_request", {"repository": "o/r", "title": "t", "head": "agent/TEST-1", "base": "main", "body": "b"}, g)  # should not raise
+
 
 # ---------------------------------------------------------------------------
 # Approval detection tests
@@ -248,6 +295,33 @@ class TestGovernanceCompletionGate:
         g = GovernanceState(GovernanceMode.AUTONOMOUS)
         result = await verify_completion(git_master_workspace, "TEST-LOW", settings, g)
         assert result.get("changes_present") is True
+        assert result.get("governance") == "autonomous"
+        assert not result.get("pr_url")  # No PR for LOW
+
+    @pytest.mark.asyncio
+    async def test_low_does_not_require_pr(self, git_master_workspace, settings):
+        """LOW must complete successfully WITHOUT a PR."""
+        from app.agent.runner import verify_completion
+        g = GovernanceState(GovernanceMode.AUTONOMOUS)
+        result = await verify_completion(git_master_workspace, "TEST-LOW", settings, g)
+        # Must succeed without checking for PR
+        assert result.get("branch") in ("main", "master")
+
+    @pytest.mark.asyncio
+    async def test_medium_requires_branch_and_push(self, git_workspace, settings):
+        """MEDIUM must use agent/<issue> branch + push (PR check skipped without GITHUB_REPO)."""
+        from app.agent.runner import verify_completion
+        from app.git.manager import run_git
+        g = GovernanceState(GovernanceMode.PR_REQUIRED)
+        # Create and push a branch
+        await run_git(git_workspace, "checkout", "-B", "agent/MED-1")
+        (git_workspace / "medium-file.md").write_text("# MEDIUM\n")
+        await run_git(git_workspace, "add", ".")
+        await run_git(git_workspace, "commit", "-m", "MEDIUM change")
+        await run_git(git_workspace, "push", "-u", "origin", "agent/MED-1")
+        result = await verify_completion(git_workspace, "MED-1", settings, g)
+        assert result.get("branch") == "agent/MED-1"
+        assert result.get("push_ok") is True
 
 
 # ---------------------------------------------------------------------------
@@ -274,5 +348,10 @@ def git_workspace(tmp_path):
 
 @pytest.fixture
 def git_master_workspace(git_workspace):
-    """Fixture that stays on main branch for LOW priority tests."""
+    """Add an additional commit on master so completion gate detects a change."""
+    (git_workspace / "low-change.txt").write_text("LOW priority change\n")
+    import subprocess
+    subprocess.run(["git", "add", "."], cwd=git_workspace, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "LOW change"], cwd=git_workspace, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=git_workspace, check=True, capture_output=True)
     return git_workspace
