@@ -172,88 +172,91 @@ async def verify_completion(workspace: Path, issue: str, settings: Settings, gov
     is_low = governance.mode.value == "autonomous"
     is_awaiting = governance.mode.value == "awaiting_approval"
 
-    # AWAITING_APPROVAL is not a failure — it is a valid waiting state.
     if is_awaiting:
         log.info("Completion gate: awaiting approval — not a failure")
         return {
             "branch": branch,
-            "changes_present": False,
-            "commits_present": False,
-            "push_ok": False,
-            "pr_url": "",
-            "governance": governance.mode.value,
-            "status": "awaiting_approval",
+            "changes_present": False, "commits_present": False,
+            "push_ok": False, "pr_url": "",
+            "governance": governance.mode.value, "status": "awaiting_approval",
         }
 
+    # ── Branch validation ────────────────────────────────────────────
     if is_low:
         if branch in ("main", "master"):
-            log.info("Completion gate: LOW priority, master branch is allowed")
+            log.info("Completion gate: LOW priority, on master — correct")
         else:
-            raise ToolExecutionError(f"completion gate: LOW priority expected master, but on branch '{branch}'")
+            raise ToolExecutionError(
+                f"completion gate: LOW priority expected master, but on branch '{branch}'"
+            )
     else:
-        if not branch or branch in ("main", "master"):
-            raise ToolExecutionError(f"completion gate: on branch '{branch}' — must be agent/{issue}")
+        expected = f"agent/{issue}"
+        if branch == expected:
+            log.info("Completion gate: on expected branch %s", expected)
+        elif branch in ("main", "master", ""):
+            raise ToolExecutionError(
+                f"completion gate: on branch '{branch}' — must be {expected}"
+            )
+        else:
+            log.warning("Completion gate: on branch '%s' but expected '%s' — allowing", branch, expected)
 
-    if not is_low:
-        try:
-            status_out = await run_git(workspace, "status", "--short")
-            checks["status"] = status_out
-        except Exception as exc:
-            raise ToolExecutionError(f"completion gate: git status failed: {exc}") from exc
+    # ── Status + log ─────────────────────────────────────────────────
+    try:
+        status_out = await run_git(workspace, "status", "--short")
+        checks["status"] = status_out
+    except Exception as exc:
+        raise ToolExecutionError(f"completion gate: git status failed: {exc}") from exc
 
-        try:
-            log_out = await run_git(workspace, "log", "--oneline", "-5")
-            checks["log"] = log_out
-        except Exception as exc:
-            raise ToolExecutionError(f"completion gate: git log failed: {exc}") from exc
+    try:
+        log_out = await run_git(workspace, "log", "--oneline", "-5")
+        checks["log"] = log_out
+    except Exception as exc:
+        raise ToolExecutionError(f"completion gate: git log failed: {exc}") from exc
 
+    # ── Push verification ────────────────────────────────────────────
     push_ok = False
-    if is_low:
-        # For LOW, verify master was pushed
-        try:
-            ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
-            push_ok = bool(ls_remote.strip())
-            checks["push_ok"] = push_ok
-        except Exception:
-            checks["push_ok"] = False
-    else:
-        try:
-            ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
-            push_ok = bool(ls_remote.strip())
-            checks["push_ok"] = push_ok
-        except Exception:
-            checks["push_ok"] = False
+    try:
+        ls_remote = await run_git(workspace, "ls-remote", "--heads", "origin", branch, timeout=30, token=settings.github_token)
+        push_ok = bool(ls_remote.strip())
+        checks["push_ok"] = push_ok
+    except Exception:
+        checks["push_ok"] = False
 
     if not push_ok:
-        msg = f"completion gate: branch '{branch}' was not pushed to remote."
-        if is_low:
-            msg = "completion gate: master was not pushed to remote."
+        msg = "completion gate: master was not pushed to remote." if is_low else f"completion gate: branch '{branch}' was not pushed to remote."
         raise ToolExecutionError(msg)
 
+    # ── PR verification / violation check ────────────────────────────
     pr_url = ""
-    if governance.requires_pr and settings.github_token:
+    if settings.github_token:
         repo = _owner_repo_from_url(settings.github_repo)
         if repo:
             try:
                 gh = GitHubClient(settings.github_token, settings.github_api_url, settings.http_timeout_seconds)
-                pulls = await gh._request("GET", f"/repos/{repo}/pulls", params={"head": f"agent/{issue}", "state": "open"})
+                pulls = await gh._request("GET", f"/repos/{repo}/pulls", params={"head": branch, "state": "open"})
                 if isinstance(pulls, list):
                     for p in pulls:
                         head_ref = (p.get("head") or {}).get("ref", "")
-                        if head_ref == f"agent/{issue}":
+                        if head_ref == branch:
                             pr_url = p.get("html_url", "")
                             checks["pr_url"] = pr_url
                             break
-                log.info("Completion gate: PR lookup: found=%s", bool(pr_url))
+                log.info("Completion gate: PR lookup for branch=%s found=%s", branch, bool(pr_url))
             except Exception as exc:
                 log.warning("Completion gate: PR lookup failed: %s", exc)
 
-        if not pr_url and repo:
+        # LOW priority must NOT have a PR
+        if is_low and pr_url:
             raise ToolExecutionError(
-                f"completion gate: no open PR found for branch agent/{issue}."
+                f"completion gate: governance violation — LOW priority must not create a PR, "
+                f"but PR found at {pr_url}"
             )
-    elif not settings.github_token:
-        log.warning("Completion gate: GitHub token not configured — skipping PR verification")
+
+        # MEDIUM/HIGH must have a PR
+        if governance.requires_pr and not pr_url and repo:
+            raise ToolExecutionError(
+                f"completion gate: no open PR found for branch '{branch}'."
+            )
 
     verification = {
         "branch": branch,
@@ -274,16 +277,17 @@ class AgentRunner:
         run_id = str(uuid.uuid4())
         log.info("Starting agent runner run_id=%s repository=%s issue=%s issue_id=%s",
                  run_id, repository, issue, issue_id)
-        manager = WorkspaceManager(
-            self.settings.workspace_root, self.settings.github_token,
-            self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email,
-        )
+
         linear = _make_linear_client(self.settings, with_oauth=True) if issue_id else None
 
-        # Resolve governance from Linear priority
+        # ── 1. Resolve governance BEFORE workspace creation ─────────────────
         priority = await resolve_linear_priority(linear, issue_id)
         governance = priority_to_governance(priority)
-        log.info("Governance resolved issue=%s priority=%s mode=%s", issue, priority, governance.mode.value)
+        is_low = governance.mode.value == "autonomous"
+        is_awaiting = governance.mode.value == "awaiting_approval"
+        actual_branch = base_branch if is_low else f"agent/{issue}"
+        log.info("Governance resolved issue=%s priority=%s mode=%s target_branch=%s",
+                 issue, priority, governance.mode.value, actual_branch)
 
         async def activity(content: str) -> None:
             if linear:
@@ -294,11 +298,18 @@ class AgentRunner:
 
         await activity("starting")
         log.info("Resolving repository run_id=%s repo=%s", run_id, repository)
-        workspace = await manager.prepare(repository, issue, base_branch)
-        log.info("Agent runner started run_id=%s issue=%s workspace=%s", run_id, issue, workspace)
 
-        # ── HIGH priority: post proposal and wait ──────────────────────────
-        if governance.mode.value == "awaiting_approval":
+        # ── 2. Prepare workspace with governance-aware branch ───────────────
+        manager = WorkspaceManager(
+            self.settings.workspace_root, self.settings.github_token,
+            self.settings.command_timeout_seconds, self.settings.agent_git_name, self.settings.agent_git_email,
+        )
+        workspace = await manager.prepare(repository, issue, base_branch, target_branch=actual_branch)
+        log.info("Agent runner started run_id=%s issue=%s workspace=%s target_branch=%s",
+                 run_id, issue, workspace, actual_branch)
+
+        # ── 3. HIGH priority: post proposal and wait ────────────────────────
+        if is_awaiting:
             await activity("preparing implementation proposal (HIGH priority)")
             try:
                 proposal = (
@@ -323,7 +334,7 @@ class AgentRunner:
                 "status": "awaiting_approval",
                 "governance": governance.mode.value,
                 "workspace": str(workspace),
-                "branch": f"agent/{issue}",
+                "branch": actual_branch,
             }
             await activity("awaiting explicit approval — implementation not started")
             return result
@@ -343,7 +354,7 @@ class AgentRunner:
         result.update({
             "run_id": run_id,
             "workspace": str(workspace),
-            "branch": f"agent/{issue}",
+            "branch": actual_branch,
             "governance": governance.mode.value,
         })
 
@@ -364,7 +375,7 @@ class AgentRunner:
         except Exception as exc:
             log.warning("Completion gate unexpected error (non-fatal): %s", exc)
 
-        if issue_id and verification.get("pr_url"):
+        if issue_id and verification and verification.get("pr_url"):
             try:
                 await activity(f"PR created: {verification['pr_url']}")
             except Exception:
